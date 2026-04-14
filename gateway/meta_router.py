@@ -50,10 +50,23 @@ _RULES: list[tuple[Category, list[str]]] = [
         r"\binterface\b",
     ]),
     ("config", [
-        r"\bconfig\b", r"\bsetup\b", r"\binstall\b", r"\benv\b",
+        r"\bconfig", r"\bsetup\b", r"\bset.?up\b", r"\binstall\b", r"\benv\b",
         r"\bsetting\b", r"\byaml\b", r"\bjson\b", r"\btoml\b",
         r"\bdotenv\b", r"\binit\b", r"\bbootstrap\b", r"\bsecret\b",
         r"\bcredential\b",
+        # Web servers / reverse proxies
+        r"\bnginx\b", r"\bapache\b", r"\bcaddy\b", r"\btraefik\b",
+        r"\bproxy\b", r"\breverse.proxy\b", r"\bvhost\b", r"\bvirtual.host\b",
+        # TLS/SSL
+        r"\bssl\b", r"\btls\b", r"\bcertificate\b", r"\bcertbot\b",
+        r"\bhttps\b", r"\bacme\b",
+        # System services
+        r"\bsystemd\b", r"\bservice\b", r"\bdaemon\b", r"\bsystemctl\b",
+        r"\bsupervisor\b", r"\bpm2\b",
+        # Firewall / network
+        r"\bfirewall\b", r"\biptables\b", r"\bufw\b", r"\bport\b",
+        # File extensions
+        r"\.conf\b", r"\.ini\b", r"\.env\b",
     ]),
     ("code", [
         r"\bcode\b", r"\bfunction\b", r"\bclass\b", r"\bscript\b",
@@ -71,7 +84,9 @@ _RULES: list[tuple[Category, list[str]]] = [
 _MODE_RULES: list[tuple[str, list[str]]] = [
     ("urgent",  [r"\burgent\b", r"\basap\b", r"\bcrash\b", r"\bdown\b", r"\bbroken\b"]),
     ("review",  [r"\breview\b", r"\bcheck\b", r"\blook.?at\b", r"\bverify\b"]),
-    ("plan",    [r"\bplan\b", r"\bdesign\b", r"\barchitect\b", r"\bpropose\b", r"\bstrategy\b"]),
+    ("plan",    [r"\bplan\b", r"\bdesign\b", r"\barchitect\b", r"\bpropose\b", r"\bstrategy\b",
+                r"\bbest.approach\b", r"\bbest.way\b", r"\brecommend\b", r"\badvise\b",
+                r"\bapproach\b", r"\bshould.i\b", r"\bwhat.would\b", r"\bhow.to.approach\b"]),
     ("execute", []),   # default
 ]
 
