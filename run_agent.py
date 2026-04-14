@@ -7792,6 +7792,34 @@ class AIAgent:
         if isinstance(persist_user_message, str):
             persist_user_message = _sanitize_surrogates(persist_user_message)
 
+        # meta-router: pre-classify CLI messages (sam/custom-hermes)
+        # Telegram already injects [META-ROUTER | type | mode] in telegram.py.
+        # For all other callers (CLI, API), classify here if no directive present.
+        if (
+            user_message
+            and len(user_message) >= 10
+            and not user_message.startswith("[META-ROUTER |")
+            and not user_message.lstrip().startswith(("!", "/", "#"))
+        ):
+            try:
+                import urllib.request as _urllib_req
+                import json as _json_mod
+                _mr_payload = _json_mod.dumps({"text": user_message}).encode()
+                _mr_req = _urllib_req.Request(
+                    "http://127.0.0.1:3120/classify",
+                    data=_mr_payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with _urllib_req.urlopen(_mr_req, timeout=1.5) as _mr_resp:
+                    _mr_data = _json_mod.loads(_mr_resp.read())
+                _mr_type = _mr_data.get("type", "research")
+                _mr_mode = _mr_data.get("mode", "execute")
+                user_message = f"[META-ROUTER | {_mr_type} | {_mr_mode}]
+{user_message}"
+            except Exception:
+                pass  # meta-router unavailable — proceed without directive
+
         # Store stream callback for _interruptible_api_call to pick up
         self._stream_callback = stream_callback
         self._persist_user_message_idx = None
