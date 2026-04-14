@@ -13,7 +13,7 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from route import classify, prepend_directive
+from gateway.meta_router import classify, prepend_directive
 
 app = FastAPI(title="Meta-Router", version="2.0.0")
 
