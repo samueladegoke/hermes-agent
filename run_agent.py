@@ -7815,8 +7815,7 @@ class AIAgent:
                     _mr_data = _json_mod.loads(_mr_resp.read())
                 _mr_type = _mr_data.get("type", "research")
                 _mr_mode = _mr_data.get("mode", "execute")
-                user_message = f"[META-ROUTER | {_mr_type} | {_mr_mode}]
-{user_message}"
+                user_message = f"[META-ROUTER | {_mr_type} | {_mr_mode}]\n{user_message}"
             except Exception:
                 pass  # meta-router unavailable — proceed without directive
 
