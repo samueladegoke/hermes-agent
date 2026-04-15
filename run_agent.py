@@ -10705,8 +10705,45 @@ class AIAgent:
                 _mr_sid = getattr(self, "session_id", None)
                 _mr_directive = getattr(self, "_mr_directive", None) or ""
                 if _mr_sdir and _mr_otask:
+                    _MR_MAX_FIX_PASSES = 2
+                    _mr_fix_pass = 0
                     _mr_phase2 = _mr_p2(_mr_rid, _mr_tt, _mr_otask, _mr_sdir,
                                         final_response, _mr_t0, _mr_art, _mr_sid)
+                    # Correction loop: if phase2 fails and fix_prompt exists,
+                    # re-run the agent with targeted fix instructions.
+                    while (
+                        not _mr_phase2.passed
+                        and _mr_fix_pass < _MR_MAX_FIX_PASSES
+                        and _mr_phase2.fix_prompt_path
+                    ):
+                        _mr_fix_pass += 1
+                        try:
+                            from pathlib import Path as _MRPath
+                            _fix_instructions = _MRPath(_mr_phase2.fix_prompt_path).read_text(encoding="utf-8")
+                            _fix_prefix = (
+                                f"[META-ROUTER | CORRECTION PASS {_mr_fix_pass}/{_MR_MAX_FIX_PASSES}]\n"
+                                f"Score: {_mr_phase2.score:.0f}/{_mr_phase2.threshold:.0f} — "
+                                f"revision needed before delivery.\n\n"
+                                f"{_fix_instructions}\n\n"
+                                f"Revise and restate your complete response below."
+                            )
+                            # Run a fresh agent turn with the correction prompt,
+                            # sharing conversation history so tools remain available.
+                            _fix_result = self.run_conversation(
+                                user_message=_fix_prefix,
+                                conversation_history=list(messages),
+                                persist_user_message="[MR correction pass — not user-visible]",
+                            )
+                            _fix_response = _fix_result.get("final_response", "").strip()
+                            if _fix_response:
+                                final_response = _fix_response
+                                # Re-evaluate with the corrected output
+                                _mr_phase2 = _mr_p2(
+                                    _mr_rid, _mr_tt, _mr_otask, _mr_sdir,
+                                    final_response, _mr_t0, _mr_art, _mr_sid,
+                                )
+                        except Exception:
+                            break  # non-fatal — proceed with last result
                     final_response = _mr_fmt(final_response, _mr_phase2, directive=_mr_directive)
                     result["final_response"] = final_response
                     for _mr_msg in reversed(messages):
