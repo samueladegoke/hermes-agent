@@ -49,6 +49,28 @@ def _init_logger() -> None:
         pass
 
 
+# ── Shared bypass contract ───────────────────────────────────────────────────
+_ACK_BYPASS = {"yes", "no", "ok"}
+
+
+def get_bypass_reason(text: str) -> str:
+    """Return a stable bypass reason string, or "" when routing should proceed."""
+    trimmed = (text or "").strip()
+    lowered = trimmed.lower()
+
+    if not trimmed:
+        return "empty"
+    if re.fullmatch(r"/\S+", trimmed):
+        return "command"
+    if trimmed[:1] in {"!", "#"}:
+        return "shellish"
+    if re.fullmatch(r"\d+", trimmed):
+        return "numeric-only"
+    if lowered in _ACK_BYPASS:
+        return "short-ack"
+    return ""
+
+
 # ── Type → pipeline mapping ─────────────────────────────────────────────────
 _PRIMARY: dict[str, str] = {
     "code":        "som",
@@ -173,48 +195,64 @@ def make_route_decision(
     except Exception:
         pass
 
-    # Classify — with artifact overrides when an artifact is active,
-    # or fall back to the base classify() when running static-default.
-    try:
-        from gateway.meta_router import _RULES, _MODE_RULES  # type: ignore[attr-defined]
-
-        if _artifact_version != "static-default" and _overrides:
-            task_type, mode, confidence = _classify_with_overrides(text, _overrides, _RULES, _MODE_RULES)
-            # Rebuild directive in the same format as meta_router.classify()
-            directive = f"[META-ROUTER | {task_type} | {mode}]"
-        else:
-            from gateway.meta_router import classify as _classify
-            result = _classify(text)
-            task_type = result.type
-            mode = result.mode
-            confidence = result.confidence
-            directive = result.directive
-
+    bypass_reason = get_bypass_reason(text)
+    if bypass_reason:
         decision = RouteDecision(
             request_id=rid,
-            type=task_type,
-            mode=mode,
-            directive=directive,
-            confidence=confidence,
-            primary=_PRIMARY.get(task_type, "som"),
-            secondary=_SECONDARY.get(task_type),
-            budget_multiplier=_BUDGET.get(task_type, 1.0),
-            routing_artifact_version=_artifact_version,
-        )
-    except Exception as e:
-        decision = RouteDecision(
-            request_id=rid,
-            type="research",
+            type="code",
             mode="execute",
-            directive="[META-ROUTER | research | execute]",
-            confidence=0.5,
-            primary="som",
-            secondary=None,
-            budget_multiplier=1.0,
+            directive="",
+            confidence=0.0,
+            primary=_PRIMARY["code"],
+            secondary=_SECONDARY["code"],
+            budget_multiplier=_BUDGET["code"],
             routing_artifact_version=_artifact_version,
             bypassed=True,
-            bypass_reason=f"classify failed: {e}",
+            bypass_reason=bypass_reason,
         )
+    else:
+        # Classify — with artifact overrides when an artifact is active,
+        # or fall back to the base classify() when running static-default.
+        try:
+            from gateway.meta_router import _RULES, _MODE_RULES  # type: ignore[attr-defined]
+
+            if _artifact_version != "static-default" and _overrides:
+                task_type, mode, confidence = _classify_with_overrides(text, _overrides, _RULES, _MODE_RULES)
+                # Rebuild directive in the same format as meta_router.classify()
+                directive = f"[META-ROUTER | {task_type} | {mode}]"
+            else:
+                from gateway.meta_router import classify as _classify
+                result = _classify(text)
+                task_type = result.type
+                mode = result.mode
+                confidence = result.confidence
+                directive = result.directive
+
+            decision = RouteDecision(
+                request_id=rid,
+                type=task_type,
+                mode=mode,
+                directive=directive,
+                confidence=confidence,
+                primary=_PRIMARY.get(task_type, "som"),
+                secondary=_SECONDARY.get(task_type),
+                budget_multiplier=_BUDGET.get(task_type, 1.0),
+                routing_artifact_version=_artifact_version,
+            )
+        except Exception as e:
+            decision = RouteDecision(
+                request_id=rid,
+                type="research",
+                mode="execute",
+                directive="[META-ROUTER | research | execute]",
+                confidence=0.5,
+                primary="som",
+                secondary=None,
+                budget_multiplier=1.0,
+                routing_artifact_version=_artifact_version,
+                bypassed=True,
+                bypass_reason=f"classify failed: {e}",
+            )
 
     # Log routing event (non-blocking, never raises)
     if _ALS_LOGGING and _log_event_fn:

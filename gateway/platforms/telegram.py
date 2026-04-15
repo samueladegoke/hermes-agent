@@ -2274,10 +2274,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[Telegram] Flushing text batch %s (%d chars)",
                 key, len(event.text or ""),
             )
-            if event.text:
-                from gateway.meta_router import classify, prepend_directive  # meta-router: sam/custom-hermes
-                _mr_result = classify(event.text)
-                event.text = prepend_directive(event.text, _mr_result)
             await self.handle_message(event)
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
@@ -2309,10 +2305,6 @@ class TelegramAdapter(BasePlatformAdapter):
             if not event:
                 return
             logger.info("[Telegram] Flushing photo batch %s with %d image(s)", batch_key, len(event.media_urls))
-            if event.text:
-                from gateway.meta_router import classify, prepend_directive  # meta-router: sam/custom-hermes
-                _mr_result = classify(event.text)
-                event.text = prepend_directive(event.text, _mr_result)
             await self.handle_message(event)
         finally:
             if self._pending_photo_batch_tasks.get(batch_key) is current_task:

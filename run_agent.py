@@ -7792,54 +7792,55 @@ class AIAgent:
         if isinstance(persist_user_message, str):
             persist_user_message = _sanitize_surrogates(persist_user_message)
 
-        # meta-router: pre-classify CLI messages — MR-ALS runtime v2
+        # meta-router: pre-classify Hermes turns with the shared MR-ALS runtime.
         # Direct classify (no HTTP) + RouteDecision + event logging + SoM Phase 1.
-        # Telegram already injects [META-ROUTER | type | mode] in telegram.py.
+        # Gateway surfaces should flow through this same path; do not pre-inject
+        # directives in platform adapters.
         self._mr_request_id = None
         self._mr_task_type = None
         self._mr_start_time = None
         self._mr_som_state_dir = None
         self._mr_original_task = None
         self._mr_routing_artifact_version = None
-        if (
-            user_message
-            and len(user_message) >= 10
-            and not user_message.startswith("[META-ROUTER |")
-            and not user_message.lstrip().startswith(("!", "/", "#"))
-        ):
+        self._mr_directive = None
+        _mr_platform = getattr(self, "platform", None) or "cli"
+        _mr_source = "cli" if _mr_platform == "cli" else "gateway"
+        if user_message and not user_message.startswith("[META-ROUTER |"):
             try:
                 import time as _mr_time
                 _mr_t0 = _mr_time.time()
                 from gateway.meta_router_runtime import make_route_decision as _mr_decide
                 _mr_dec = _mr_decide(
                     text=user_message,
-                    source="cli",
-                    surface="cli",
+                    source=_mr_source,
+                    surface=_mr_platform,
                     session_id=getattr(self, "session_id", None),
                 )
                 _mr_original = user_message
-                user_message = f"{_mr_dec.directive}\n{user_message}"
                 if persist_user_message is None:
                     persist_user_message = _mr_original
-                self._mr_request_id = _mr_dec.request_id
-                self._mr_task_type = _mr_dec.type
-                self._mr_start_time = _mr_t0
-                self._mr_original_task = _mr_original
-                self._mr_routing_artifact_version = getattr(_mr_dec, "routing_artifact_version", None)
-                # Phase 1: generate SoM targets (fast, rule-based — no LLM)
-                if len(_mr_original) >= 40 and _mr_dec.confidence >= 0.35:
-                    try:
-                        from gateway.meta_router_executor import run_phase1 as _mr_p1
-                        _prep = _mr_p1(_mr_original, _mr_dec.type)
-                        if _prep.phase1_ok and _prep.targets_context:
-                            self._mr_som_state_dir = _prep.state_dir
-                            user_message = (
-                                f"{_mr_dec.directive}\n\n"
-                                f"{_prep.targets_context}\n\n"
-                                f"{_mr_original}"
-                            )
-                    except Exception:
-                        pass  # Phase 1 failure is non-fatal
+                if not _mr_dec.bypassed and _mr_dec.directive:
+                    user_message = f"{_mr_dec.directive}\n{user_message}"
+                    self._mr_request_id = _mr_dec.request_id
+                    self._mr_task_type = _mr_dec.type
+                    self._mr_start_time = _mr_t0
+                    self._mr_original_task = _mr_original
+                    self._mr_routing_artifact_version = getattr(_mr_dec, "routing_artifact_version", None)
+                    self._mr_directive = _mr_dec.directive
+                    # Phase 1: generate SoM targets (fast, rule-based — no LLM)
+                    if len(_mr_original) >= 40 and _mr_dec.confidence >= 0.35:
+                        try:
+                            from gateway.meta_router_executor import run_phase1 as _mr_p1
+                            _prep = _mr_p1(_mr_original, _mr_dec.type)
+                            if _prep.phase1_ok and _prep.targets_context:
+                                self._mr_som_state_dir = _prep.state_dir
+                                user_message = (
+                                    f"{_mr_dec.directive}\n\n"
+                                    f"{_prep.targets_context}\n\n"
+                                    f"{_mr_original}"
+                                )
+                        except Exception:
+                            pass  # Phase 1 failure is non-fatal
             except Exception:
                 pass  # meta-router runtime unavailable — proceed without directive
 
@@ -10687,13 +10688,13 @@ class AIAgent:
         except Exception as exc:
             logger.warning("on_session_end hook failed: %s", exc)
 
-        # MR-ALS post-turn: SoM Phase 2 scoring + outcome logging (background)
+        # MR-ALS post-turn: SoM Phase 2 scoring + outcome logging + receipt formatting
         _mr_rid = getattr(self, "_mr_request_id", None)
         if _mr_rid and final_response and final_response.strip():
             try:
                 from gateway.meta_router_executor import (
+                    format_routed_response as _mr_fmt,
                     run_phase2 as _mr_p2,
-                    run_phase2_async as _mr_p2_async,
                     run_outcome_only as _mr_out_only,
                 )
                 _mr_sdir = getattr(self, "_mr_som_state_dir", None)
@@ -10702,13 +10703,16 @@ class AIAgent:
                 _mr_otask = getattr(self, "_mr_original_task", None) or ""
                 _mr_art = getattr(self, "_mr_routing_artifact_version", None) or "static-default"
                 _mr_sid = getattr(self, "session_id", None)
+                _mr_directive = getattr(self, "_mr_directive", None) or ""
                 if _mr_sdir and _mr_otask:
-                    if getattr(self, "platform", None) == "cli":
-                        _mr_p2(_mr_rid, _mr_tt, _mr_otask, _mr_sdir,
-                               final_response, _mr_t0, _mr_art, _mr_sid)
-                    else:
-                        _mr_p2_async(_mr_rid, _mr_tt, _mr_otask, _mr_sdir,
-                                     final_response, _mr_t0, _mr_art, _mr_sid)
+                    _mr_phase2 = _mr_p2(_mr_rid, _mr_tt, _mr_otask, _mr_sdir,
+                                        final_response, _mr_t0, _mr_art, _mr_sid)
+                    final_response = _mr_fmt(final_response, _mr_phase2, directive=_mr_directive)
+                    result["final_response"] = final_response
+                    for _mr_msg in reversed(messages):
+                        if _mr_msg.get("role") == "assistant":
+                            _mr_msg["content"] = final_response
+                            break
                 else:
                     _mr_out_only(_mr_rid, _mr_tt, _mr_t0, _mr_art, _mr_sid)
             except Exception:
@@ -10720,6 +10724,11 @@ class AIAgent:
                 self._mr_start_time = None
                 self._mr_original_task = None
                 self._mr_routing_artifact_version = None
+                self._mr_directive = None
+
+        # Re-persist after MR post-turn processing so session JSON/SQLite reflect
+        # the final user-visible answer rather than the pre-evaluation draft.
+        self._persist_session(messages, conversation_history)
 
         return result
 

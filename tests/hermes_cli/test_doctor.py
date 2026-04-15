@@ -40,6 +40,10 @@ class TestProviderEnvDetection:
         content = "OPENAI_BASE_URL=http://localhost:8080/v1\n"
         assert _has_provider_env_config(content)
 
+    def test_detects_tavily_api_key(self):
+        content = "TAVILY_API_KEY=tvly-dev-example\n"
+        assert _has_provider_env_config(content)
+
     def test_returns_false_when_no_provider_settings(self):
         content = "TERMINAL_ENV=local\n"
         assert not _has_provider_env_config(content)

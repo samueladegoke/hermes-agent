@@ -11,6 +11,7 @@ Phase 2 (post-LLM):
   - run the SoM complete pipeline
   - run ADV_PASS for routed task types
   - log a routing outcome to the MR-ALS experience plane
+  - return a structured delivery result for the caller
 
 Phase 4+ threshold trigger:
   every 10 outcomes → launch mr_als_runner.py --phase 4,5 --force
@@ -27,7 +28,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -85,7 +86,7 @@ _MR_TO_SOM_TYPE = {
 }
 
 
-# ── PrepResult ─────────────────────────────────────────────────────────────────
+# ── Result containers ─────────────────────────────────────────────────────────
 
 @dataclass
 class PrepResult:
@@ -95,7 +96,7 @@ class PrepResult:
 
     @property
     def ok(self) -> bool:
-        return self.som_state_dir is not None and not self.error
+        return self.som_state_dir is not None
 
     # Backward-compatible aliases used by the current run_agent.py integration.
     @property
@@ -105,6 +106,31 @@ class PrepResult:
     @property
     def state_dir(self) -> Optional[Path]:
         return self.som_state_dir
+
+
+@dataclass
+class Phase2Result:
+    request_id: str
+    task_type: str
+    state_dir: Optional[Path]
+    routing_artifact_version: str
+    passed: bool
+    score: Optional[float]
+    verdict: str
+    threshold: Optional[float]
+    oracle_verdict: str
+    adv_pass_clean: Optional[bool]
+    adv_findings_count: int
+    delivery_gate_passed: Optional[bool]
+    score_card: Optional[str]
+    ref_entry: Optional[dict]
+    delivery_path: Optional[str]
+    fix_prompt_path: Optional[str]
+    error: Optional[str] = None
+    notes: list[str] = field(default_factory=list)
+    som_score: Optional[float] = None
+    eop_score: Optional[float] = None
+    composite_score: Optional[float] = None
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -130,6 +156,162 @@ def _coerce_score(value) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _load_json_file(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _summarize_ref(ref_entry: Optional[dict]) -> str:
+    if not isinstance(ref_entry, dict):
+        return ""
+    ref_id = ref_entry.get("id") or ref_entry.get("ref_id") or ""
+    if not ref_id:
+        return ""
+    score = ref_entry.get("score")
+    verdict = ref_entry.get("verdict")
+    tail = []
+    if score is not None:
+        tail.append(str(score))
+    if verdict:
+        tail.append(str(verdict))
+    suffix = f" ({', '.join(tail)})" if tail else ""
+    return f"REF: {ref_id}{suffix}"
+
+
+def populate_evidence_artifacts(task_text: str, final_response: str, state_dir: Path) -> None:
+    """Best-effort seeding of SoM v3.1 evidence artifacts from the drafted response."""
+    state_dir = Path(state_dir)
+    hypothesis_path = state_dir / "hypothesis.json"
+    evidence_path = state_dir / "verification_evidence.json"
+    edge_scan_path = state_dir / "edge_scan.json"
+
+    hypothesis = _load_json_file(hypothesis_path) if hypothesis_path.exists() else {}
+    evidence = _load_json_file(evidence_path) if evidence_path.exists() else {"items": []}
+    edge_scan = _load_json_file(edge_scan_path) if edge_scan_path.exists() else {}
+
+    bullet_items: list[str] = []
+    for raw_line in (final_response or "").splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith(("- ", "* ")):
+            bullet_items.append(stripped[2:].strip())
+    if not bullet_items and final_response.strip():
+        bullet_items.append(final_response.strip()[:240])
+
+    hypothesis.update({
+        "task": hypothesis.get("task") or task_text,
+        "hypothesis": hypothesis.get("hypothesis") or f"The drafted output satisfies the routed task: {task_text[:180]}",
+        "test_plan": hypothesis.get("test_plan") or [
+            "Review output.md for completeness against the task.",
+            "Compare any claimed runtime verification against the drafted response.",
+        ],
+        "result": "supported",
+        "notes": "Seeded by Hermes meta_router_executor from the drafted response.",
+    })
+    if hypothesis_path.exists():
+        hypothesis_path.write_text(json.dumps(hypothesis, indent=2), encoding="utf-8")
+
+    items = evidence.get("items") if isinstance(evidence.get("items"), list) else []
+    seen_details = {item.get("detail") for item in items if isinstance(item, dict)}
+    for detail in bullet_items[:5]:
+        if detail and detail not in seen_details:
+            items.append({
+                "kind": "drafted-runtime-evidence",
+                "detail": detail,
+                "source": "final_response",
+            })
+            seen_details.add(detail)
+    if not items:
+        items.append({
+            "kind": "drafted-output",
+            "detail": "output.md was produced by Hermes for routed evaluation.",
+            "source": "meta_router_executor",
+        })
+    evidence["items"] = items
+    if evidence_path.exists():
+        evidence_path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+
+    if edge_scan_path.exists() and "categories_checked" not in edge_scan:
+        edge_scan["categories_checked"] = []
+        edge_scan["findings"] = edge_scan.get("findings", [])
+        edge_scan_path.write_text(json.dumps(edge_scan, indent=2), encoding="utf-8")
+
+
+def resolve_phase2_tier(state_dir: Path) -> str:
+    state_dir = Path(state_dir)
+    manifest = _load_json_file(state_dir / "manifest.json")
+    if manifest.get("tier"):
+        return str(manifest["tier"])
+    targets = _load_json_file(state_dir / "targets.json")
+    if targets.get("tier"):
+        return str(targets["tier"])
+    return "standard"
+
+
+def format_routed_response(raw_response: str, phase2: Phase2Result, directive: str = "") -> str:
+    """Format the final user-visible response from a routed turn."""
+    receipt_lines: list[str] = []
+    if directive:
+        receipt_lines.append(f"Directive: {directive}")
+    receipt_lines.append(f"Artifact: {phase2.routing_artifact_version}")
+    if phase2.score is not None:
+        threshold = f" / threshold {int(phase2.threshold)}" if phase2.threshold is not None else ""
+        receipt_lines.append(f"RQL Score: {phase2.score:.1f}/100 ({phase2.verdict}){threshold}")
+    if phase2.delivery_gate_passed is True:
+        receipt_lines.append("Score gate: PASS")
+    elif phase2.delivery_gate_passed is False:
+        if phase2.score is not None and phase2.threshold is not None:
+            receipt_lines.append(f"Score gate: FAIL ({phase2.score:.1f} < {phase2.threshold:.1f})")
+        else:
+            receipt_lines.append("Score gate: FAIL")
+    receipt_lines.append(f"Oracle: {phase2.oracle_verdict}")
+    if phase2.adv_pass_clean is True:
+        receipt_lines.append(f"ADV_PASS: PASS ({phase2.adv_findings_count} findings)")
+    elif phase2.adv_pass_clean is False:
+        receipt_lines.append(f"ADV_PASS: FAIL ({phase2.adv_findings_count} findings)")
+    if phase2.state_dir is not None:
+        receipt_lines.append(f"State dir: {phase2.state_dir}")
+    if phase2.delivery_path:
+        receipt_lines.append(f"Delivery: {phase2.delivery_path}")
+    ref_line = _summarize_ref(phase2.ref_entry)
+    if ref_line:
+        receipt_lines.append(ref_line)
+
+    if phase2.passed:
+        pieces = [raw_response.strip(), "", "[META-ROUTER RECEIPT]"]
+        pieces.extend(receipt_lines)
+        return "\n".join(p for p in pieces if p is not None)
+
+    threshold_only_failure = (
+        phase2.delivery_gate_passed is False
+        and phase2.oracle_verdict == "PASS"
+        and phase2.adv_pass_clean is not False
+        and not phase2.error
+    )
+    lead = (
+        "Backend evaluation blocked final delivery: the draft passed Oracle and ADV_PASS, but missed the final score threshold."
+        if threshold_only_failure
+        else "Backend evaluation failed. The draft output did not satisfy the routed SoM/EOP gates."
+    )
+
+    lines = [lead, "", "[META-ROUTER RECEIPT]"]
+    lines.extend(receipt_lines)
+    if phase2.fix_prompt_path:
+        lines.append(f"Fix prompt: {phase2.fix_prompt_path}")
+    if phase2.error:
+        lines.append(f"Error: {phase2.error}")
+    if raw_response.strip():
+        lines.extend([
+            "",
+            "Draft output (not approved for final delivery):",
+            raw_response.strip(),
+        ])
+    return "\n".join(lines)
 
 
 def _scaffold_evidence(state_dir: Path, task_text: str) -> Optional[str]:
@@ -258,6 +440,43 @@ def _format_targets(targets: dict | list, mr_type: str) -> str:
         return ""
 
 
+def _count_outcomes() -> int:
+    if not _OUTCOMES_JSONL.exists():
+        return 0
+    try:
+        return sum(1 for line in _OUTCOMES_JSONL.read_text(encoding="utf-8").splitlines() if line.strip())
+    except Exception:
+        return 0
+
+
+def _trigger_optimizer_bg() -> None:
+    """Launch mr_als_runner.py --phase 4,5 --force in a background subprocess."""
+    if not _RUNNER_PATH.exists():
+        return
+
+    def _run():
+        try:
+            subprocess.run(
+                [sys.executable, str(_RUNNER_PATH), "--phase", "4,5", "--force"],
+                capture_output=True,
+                timeout=300,
+            )
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_run, daemon=True, name="mr-als-optimizer")
+    t.start()
+
+
+def _maybe_trigger_optimizer() -> None:
+    try:
+        n = _count_outcomes()
+        if n >= 10 and n % 10 == 0:
+            _trigger_optimizer_bg()
+    except Exception:
+        pass
+
+
 # ── Phase 1: pre-LLM SoM target generation ────────────────────────────────────
 
 def run_phase1(task_text: str, mr_type: str) -> PrepResult:
@@ -312,34 +531,6 @@ def run_phase1(task_text: str, mr_type: str) -> PrepResult:
 
 # ── Phase 2: post-LLM outcome logging ─────────────────────────────────────────
 
-def _count_outcomes() -> int:
-    if not _OUTCOMES_JSONL.exists():
-        return 0
-    try:
-        return sum(1 for line in _OUTCOMES_JSONL.read_text(encoding="utf-8").splitlines() if line.strip())
-    except Exception:
-        return 0
-
-
-def _trigger_optimizer_bg() -> None:
-    """Launch mr_als_runner.py --phase 4,5 --force in a background subprocess."""
-    if not _RUNNER_PATH.exists():
-        return
-
-    def _run():
-        try:
-            subprocess.run(
-                [sys.executable, str(_RUNNER_PATH), "--phase", "4,5", "--force"],
-                capture_output=True,
-                timeout=300,
-            )
-        except Exception:
-            pass
-
-    t = threading.Thread(target=_run, daemon=True, name="mr-als-optimizer")
-    t.start()
-
-
 def run_phase2(
     request_id: str,
     task_type: str,
@@ -349,9 +540,9 @@ def run_phase2(
     t0: float,
     routing_artifact_version: str = "static-default",
     session_id: Optional[str] = None,
-) -> None:
+) -> Phase2Result:
     """Run SoM completion + outcome logging synchronously."""
-    _do_phase2(
+    return _do_phase2(
         request_id,
         task_type,
         task_text,
@@ -400,26 +591,41 @@ def _do_phase2(
     t0: float,
     routing_artifact_version: str,
     session_id: Optional[str],
-) -> None:
-    """Inner blocking implementation of Phase 2. Runs in a background thread."""
+) -> Phase2Result:
+    """Inner blocking implementation of Phase 2."""
     latency_ms = round((time.time() - t0) * 1000, 1)
     som_score: Optional[float] = None
     composite_score: Optional[float] = None
     eop_score: Optional[float] = None
-    oracle_verdict: Optional[str] = "SKIPPED"
+    oracle_verdict = "SKIPPED"
     adv_pass_clean: Optional[bool] = None
+    adv_findings_count = 0
+    delivery_gate_passed: Optional[bool] = None
+    score_card: Optional[str] = None
+    ref_entry: Optional[dict] = None
+    delivery_path: Optional[str] = None
+    fix_prompt_path: Optional[str] = None
+    verdict = "UNKNOWN"
+    threshold: Optional[float] = None
     error: Optional[str] = None
     notes: list[str] = []
+    evidence_valid: Optional[bool] = None
+    state_dir = som_state_dir
 
     try:
         if som_state_dir and _SOM_PIPELINE.exists():
             out_md = som_state_dir / "output.md"
+            scores_path = som_state_dir / "scores.json"
+            delivery_json_path = som_state_dir / "delivery.json"
+            fix_prompt = som_state_dir / "fix_prompt.md"
 
             agent_wrote = out_md.exists() and out_md.stat().st_size >= 50
             if not agent_wrote and final_response and final_response.strip():
                 out_md.write_text(final_response, encoding="utf-8")
+            populate_evidence_artifacts(task_text, out_md.read_text(encoding="utf-8") if out_md.exists() else final_response, som_state_dir)
 
             som_type = _MR_TO_SOM_TYPE.get(task_type, "code")
+            som_tier = resolve_phase2_tier(som_state_dir)
             result = subprocess.run(
                 [
                     sys.executable,
@@ -429,6 +635,8 @@ def _do_phase2(
                     task_text[:2000],
                     "--task-type",
                     som_type,
+                    "--tier",
+                    som_tier,
                     "--task-id",
                     som_state_dir.name,
                     "--state-dir",
@@ -440,19 +648,50 @@ def _do_phase2(
             )
 
             preview = (result.stderr or result.stdout or "").strip()
+            data = {}
             if result.returncode not in (0, 1):
                 error = f"som complete exit {result.returncode}: {preview[:200]}"
             else:
                 data = _parse_json_payload(result.stdout)
-                som_score = _coerce_score(data.get("score"))
-                composite_score = som_score
-                oracle_verdict = data.get("oracle") or ("PASS" if data.get("passed") else "FAIL")
                 notes.append(f"som_status={data.get('status', 'unknown')}")
-                notes.append(f"artifact={routing_artifact_version}")
-                if session_id:
-                    notes.append(f"session={session_id}")
                 if result.returncode == 1:
                     notes.append("som_returncode=1")
+
+            scores_json = _load_json_file(scores_path)
+            delivery_json = _load_json_file(delivery_json_path)
+
+            som_score = (
+                _coerce_score(data.get("score"))
+                or _coerce_score(scores_json.get("total_weighted_score"))
+                or _coerce_score(scores_json.get("weighted_score"))
+                or _coerce_score(scores_json.get("total_score"))
+            )
+            verdict = str(
+                data.get("verdict")
+                or scores_json.get("verdict")
+                or delivery_json.get("scores", {}).get("verdict")
+                or "UNKNOWN"
+            )
+            threshold = (
+                _coerce_score(scores_json.get("threshold"))
+                or _coerce_score(data.get("scores", {}).get("threshold"))
+                or _coerce_score(delivery_json.get("scores", {}).get("threshold"))
+            )
+            oracle_verdict = str(
+                data.get("oracle")
+                or delivery_json.get("oracle")
+                or ("PASS" if data.get("passed") else "FAIL")
+            )
+            delivery_gate = data.get("delivery_gate") or delivery_json.get("delivery_gate") or {}
+            if isinstance(delivery_gate, dict):
+                delivery_gate_passed = delivery_gate.get("all_passed")
+            score_card = data.get("score_card") or delivery_json.get("score_card")
+            ref_entry = data.get("ref_entry") or delivery_json.get("ref_entry")
+            delivery_path = data.get("delivery_path") or (str(delivery_json_path) if delivery_json_path.exists() else None)
+            fix_prompt_path = str(fix_prompt) if fix_prompt.exists() else None
+            notes.append(f"artifact={routing_artifact_version}")
+            if session_id:
+                notes.append(f"session={session_id}")
 
             evidence_valid, evidence_preview = _validate_evidence(som_state_dir)
             if evidence_valid is not None:
@@ -460,19 +699,64 @@ def _do_phase2(
                 if not evidence_valid and evidence_preview:
                     notes.append(f"evidence={evidence_preview}")
 
+            if delivery_gate_passed is not None:
+                notes.append(f"delivery_gate_passed={str(bool(delivery_gate_passed)).lower()}")
+
             if task_type in _ADV_TASK_TYPES and out_md.exists():
                 adv_pass_clean, adv_data, adv_preview = _run_adv_pass(task_text, som_state_dir, out_md)
+                if adv_data is not None:
+                    adv_findings_count = len([
+                        finding for finding in adv_data.get("findings", [])
+                        if finding.get("severity") in ("medium", "high")
+                    ])
                 if adv_pass_clean is not None:
                     eop_score = 100.0 if adv_pass_clean else 0.0
                     notes.append(f"adv_pass_clean={str(adv_pass_clean).lower()}")
-                    if adv_data is not None:
-                        notes.append(f"adv_findings={len(adv_data.get('findings', []))}")
-                    elif adv_preview:
-                        notes.append(f"adv_preview={adv_preview}")
+                    notes.append(f"adv_findings={adv_findings_count}")
+                elif adv_preview:
+                    notes.append(f"adv_preview={adv_preview}")
         else:
             error = "phase2 skipped: missing som_state_dir or som_pipeline"
     except Exception as exc:
         error = f"phase2 exception: {exc}"
+
+    if som_score is not None and eop_score is not None:
+        composite_score = round((som_score * 0.6) + (eop_score * 0.4), 1)
+    else:
+        composite_score = som_score
+    outcome_quality = composite_score if composite_score is not None else som_score
+
+    passed = bool(delivery_gate_passed) if delivery_gate_passed is not None else False
+    if oracle_verdict != "PASS":
+        passed = False
+    if adv_pass_clean is False:
+        passed = False
+    if error:
+        passed = False
+
+    phase2 = Phase2Result(
+        request_id=request_id,
+        task_type=task_type,
+        state_dir=state_dir,
+        routing_artifact_version=routing_artifact_version,
+        passed=passed,
+        score=som_score,
+        verdict=verdict,
+        threshold=threshold,
+        oracle_verdict=oracle_verdict,
+        adv_pass_clean=adv_pass_clean,
+        adv_findings_count=adv_findings_count,
+        delivery_gate_passed=delivery_gate_passed,
+        score_card=score_card,
+        ref_entry=ref_entry,
+        delivery_path=delivery_path,
+        fix_prompt_path=fix_prompt_path,
+        error=error,
+        notes=list(notes),
+        som_score=som_score,
+        eop_score=eop_score,
+        composite_score=composite_score,
+    )
 
     lw = _load_log_writer()
     if lw and hasattr(lw, "log_routing_outcome"):
@@ -483,8 +767,14 @@ def _do_phase2(
                 composite_score=composite_score,
                 som_score=som_score,
                 eop_score=eop_score,
+                outcome_quality=outcome_quality,
                 oracle_verdict=oracle_verdict,
                 adv_pass_clean=adv_pass_clean,
+                adv_findings_count=adv_findings_count,
+                evidence_valid=evidence_valid,
+                delivery_gate_passed=delivery_gate_passed,
+                verdict=verdict,
+                threshold=threshold,
                 latency_ms=latency_ms,
                 error=error,
                 notes=" | ".join(notes) if notes else None,
@@ -492,12 +782,8 @@ def _do_phase2(
         except Exception:
             pass
 
-    try:
-        n = _count_outcomes()
-        if n >= 10 and n % 10 == 0:
-            _trigger_optimizer_bg()
-    except Exception:
-        pass
+    _maybe_trigger_optimizer()
+    return phase2
 
 
 # ── Convenience: log outcome only (no SoM pipeline) ───────────────────────────
@@ -531,3 +817,4 @@ def run_outcome_only(
             )
         except Exception:
             pass
+    _maybe_trigger_optimizer()
