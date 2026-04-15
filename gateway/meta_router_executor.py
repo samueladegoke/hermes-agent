@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-meta_router_executor.py — MR-ALS Phase 1+2: SoM Execution Adapter
+meta_router_executor.py — Hermes bridge from meta-router decisions to SoM/MR-ALS.
 
-Phase 1 (pre-LLM):  run som_pipeline --tier trivial to generate targets
-Phase 2 (post-LLM): run complete_pipeline + ADV_PASS + log outcome
+Phase 1 (pre-LLM):
+  - run the SoM prepare pipeline to create a state dir + targets
+  - scaffold SoM v3.1 evidence artifacts
 
-Phase 4+ threshold trigger: every 10 new outcomes → launch mr_als_runner.py
-  --phase 4,5 --force in a background subprocess to regenerate + re-evaluate
-  candidate artifacts.
+Phase 2 (post-LLM):
+  - persist the assistant output to output.md
+  - run the SoM complete pipeline
+  - run ADV_PASS for routed task types
+  - log a routing outcome to the MR-ALS experience plane
 
-Used by run_agent.py (imported at module level).
+Phase 4+ threshold trigger:
+  every 10 outcomes → launch mr_als_runner.py --phase 4,5 --force
+  in a background subprocess to regenerate/evaluate routing candidates.
 
-NOTE: meta-router/ directory has a hyphen — cannot be a Python package.
-      log_writer.py is loaded via importlib.util.spec_from_file_location.
+NOTE: meta-router/ is a hyphenated directory, so support modules are loaded
+via importlib.util.spec_from_file_location instead of normal package imports.
 """
 from __future__ import annotations
 
@@ -34,8 +39,13 @@ _LOG_WRITER_PATH = _EXP_DIR / "log_writer.py"
 _OUTCOMES_JSONL = _EXP_DIR / "routing_outcomes.jsonl"
 _RUNNER_PATH = _SCRIPTS_DIR / "mr_als_runner.py"
 
-_SOM_DIR = Path("/home/samade10/.openclaw/workspace/skills/process/som")
-_SOM_PIPELINE = _SOM_DIR / "som_pipeline.py"
+_WORKSPACE = Path("/home/samade10/.openclaw/workspace")
+_RQL_SCRIPTS_DIR = _WORKSPACE / "rql/scripts"
+_SOM_PIPELINE = _RQL_SCRIPTS_DIR / "som_pipeline.py"
+_ADV_PASS = _RQL_SCRIPTS_DIR / "adv_pass.py"
+_EVIDENCE_CONTRACT = _RQL_SCRIPTS_DIR / "evidence_contract.py"
+
+_ADV_TASK_TYPES = {"code", "audit", "production", "integration"}
 
 # ── Log writer lazy-init ───────────────────────────────────────────────────────
 _lw_mod = None
@@ -53,6 +63,8 @@ def _load_log_writer():
             return None
         try:
             spec = importlib.util.spec_from_file_location("_mr_log_writer", _LOG_WRITER_PATH)
+            if spec is None or spec.loader is None:
+                return None
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             _lw_mod = mod
@@ -63,13 +75,13 @@ def _load_log_writer():
 
 # ── MR type → SoM type map ─────────────────────────────────────────────────────
 _MR_TO_SOM_TYPE = {
-    "code":        "code",
-    "audit":       "general",
-    "research":    "research",
-    "production":  "general",
+    "code": "code",
+    "audit": "general",
+    "research": "research",
+    "production": "general",
     "integration": "code",
-    "design":      "design",
-    "config":      "config",
+    "design": "design",
+    "config": "config",
 }
 
 
@@ -78,59 +90,206 @@ _MR_TO_SOM_TYPE = {
 @dataclass
 class PrepResult:
     som_state_dir: Optional[Path]
-    targets_context: str  # formatted block for injection into task text
+    targets_context: str
     error: Optional[str] = None
 
     @property
     def ok(self) -> bool:
         return self.som_state_dir is not None and not self.error
 
+    # Backward-compatible aliases used by the current run_agent.py integration.
+    @property
+    def phase1_ok(self) -> bool:
+        return self.ok
 
-# ── Phase 1: pre-LLM SoM target generation ────────────────────────────────────
+    @property
+    def state_dir(self) -> Optional[Path]:
+        return self.som_state_dir
 
-def run_phase1(task_text: str, mr_type: str) -> PrepResult:
-    """
-    Run SoM --tier trivial to generate routing targets before the LLM call.
-    Returns PrepResult with state_dir and formatted targets_context.
-    Never raises — returns PrepResult with error= on failure.
-    """
-    if not _SOM_PIPELINE.exists():
-        return PrepResult(None, "", error="som_pipeline.py not found")
 
-    som_type = _MR_TO_SOM_TYPE.get(mr_type, "code")
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _parse_json_payload(text: str) -> dict:
+    payload = (text or "").strip()
+    if not payload:
+        raise ValueError("empty JSON payload")
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        start = payload.find("{")
+        end = payload.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        return json.loads(payload[start:end + 1])
+
+
+def _coerce_score(value) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _scaffold_evidence(state_dir: Path, task_text: str) -> Optional[str]:
+    if not _EVIDENCE_CONTRACT.exists():
+        return None
     try:
         result = subprocess.run(
             [
-                sys.executable, str(_SOM_PIPELINE),
-                "--tier", "trivial",
-                "--task-type", som_type,
-                "--task-text", task_text[:2000],
-                "--output-format", "json",
+                sys.executable,
+                str(_EVIDENCE_CONTRACT),
+                "--scaffold",
+                "--task",
+                task_text[:2000],
+                "--state-dir",
+                str(state_dir),
             ],
             capture_output=True,
             text=True,
             timeout=30,
         )
         if result.returncode != 0:
-            return PrepResult(None, "", error=f"som_pipeline exit {result.returncode}: {result.stderr[:200]}")
+            return f"evidence scaffold exit {result.returncode}: {(result.stderr or result.stdout).strip()[:200]}"
+        return None
+    except Exception as exc:
+        return f"evidence scaffold exception: {exc}"
 
-        # Parse JSON from stdout
-        stdout = result.stdout.strip()
+
+def _validate_evidence(state_dir: Path) -> tuple[Optional[bool], str]:
+    if not _EVIDENCE_CONTRACT.exists():
+        return None, ""
+    try:
+        result = subprocess.run(
+            [sys.executable, str(_EVIDENCE_CONTRACT), "--validate", "--state-dir", str(state_dir)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        preview = (result.stderr or result.stdout or "").strip()
+        return result.returncode == 0, preview[:200]
+    except Exception as exc:
+        return None, f"evidence validate exception: {exc}"
+
+
+def _run_adv_pass(task_text: str, state_dir: Path, output_path: Path) -> tuple[Optional[bool], Optional[dict], str]:
+    if not _ADV_PASS.exists() or not output_path.exists():
+        return None, None, ""
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(_ADV_PASS),
+                "--state-dir",
+                str(state_dir),
+                "--task",
+                task_text[:2000],
+                "--output",
+                str(output_path),
+                "--trigger-reason",
+                "meta-router routed adversarial pass",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        data = None
+        preview = (result.stderr or result.stdout or "").strip()
         try:
-            data = json.loads(stdout)
-        except json.JSONDecodeError:
-            # Try to find JSON block in mixed output
-            for line in reversed(stdout.splitlines()):
-                line = line.strip()
-                if line.startswith("{"):
-                    try:
-                        data = json.loads(line)
-                        break
-                    except json.JSONDecodeError:
-                        pass
-            else:
-                return PrepResult(None, "", error="Could not parse som_pipeline JSON output")
+            data = _parse_json_payload(result.stdout)
+        except Exception:
+            adv_file = state_dir / "adversarial_findings.json"
+            if adv_file.exists():
+                try:
+                    data = json.loads(adv_file.read_text(encoding="utf-8"))
+                except Exception:
+                    data = None
+        clean = result.returncode == 0
+        if data is not None:
+            medium_high = [
+                finding for finding in data.get("findings", [])
+                if finding.get("severity") in ("medium", "high")
+            ]
+            clean = len(medium_high) == 0
+        return clean, data, preview[:200]
+    except Exception as exc:
+        return None, None, f"adv_pass exception: {exc}"
 
+
+def _format_targets(targets: dict | list, mr_type: str) -> str:
+    """Format targets into a compact context block for prompt injection."""
+    try:
+        if isinstance(targets, dict):
+            items = (
+                targets.get("dimensions")
+                or targets.get("targets")
+                or targets.get("items")
+                or []
+            )
+        else:
+            items = targets
+
+        if not items:
+            return ""
+
+        lines = [f"[SoM Targets | {mr_type}]"]
+        for i, item in enumerate(items[:8], 1):
+            if isinstance(item, dict):
+                label = item.get("name") or item.get("label") or item.get("target") or f"target-{i}"
+                desc = (
+                    item.get("description")
+                    or item.get("rubric")
+                    or item.get("measure_type")
+                    or ""
+                )
+                extras = []
+                if item.get("weight") is not None:
+                    extras.append(f"weight={item['weight']}")
+                if item.get("measure_type"):
+                    extras.append(f"measure={item['measure_type']}")
+                suffix = f" ({', '.join(extras)})" if extras else ""
+                lines.append(f"  {i}. {label}" + (f" — {desc}" if desc else "") + suffix)
+            else:
+                lines.append(f"  {i}. {item}")
+        lines.append("[/SoM Targets]")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
+# ── Phase 1: pre-LLM SoM target generation ────────────────────────────────────
+
+def run_phase1(task_text: str, mr_type: str) -> PrepResult:
+    """
+    Run the SoM prepare pipeline to generate state_dir + targets before the LLM call.
+    Never raises — returns PrepResult(error=...) on failure.
+    """
+    if not _SOM_PIPELINE.exists():
+        return PrepResult(None, "", error=f"som_pipeline.py not found at {_SOM_PIPELINE}")
+
+    som_type = _MR_TO_SOM_TYPE.get(mr_type, "code")
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(_SOM_PIPELINE),
+                "--task",
+                task_text[:2000],
+                "--task-type",
+                som_type,
+                "--tier",
+                "trivial",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        if result.returncode != 0:
+            preview = (result.stderr or result.stdout or "").strip()
+            return PrepResult(None, "", error=f"som_pipeline exit {result.returncode}: {preview[:200]}")
+
+        data = _parse_json_payload(result.stdout)
         state_dir = data.get("state_dir") or data.get("output_dir")
         if not state_dir:
             return PrepResult(None, "", error="som_pipeline returned no state_dir")
@@ -140,39 +299,15 @@ def run_phase1(task_text: str, mr_type: str) -> PrepResult:
         if not targets_file.exists():
             return PrepResult(state_path, "", error="targets.json not found in state_dir")
 
-        targets = json.loads(targets_file.read_text())
+        evidence_error = _scaffold_evidence(state_path, task_text)
+        targets = json.loads(targets_file.read_text(encoding="utf-8"))
         targets_context = _format_targets(targets, mr_type)
-        return PrepResult(state_path, targets_context)
+        return PrepResult(state_path, targets_context, error=evidence_error)
 
     except subprocess.TimeoutExpired:
-        return PrepResult(None, "", error="som_pipeline timed out (>30s)")
-    except Exception as e:
-        return PrepResult(None, "", error=f"phase1 exception: {e}")
-
-
-def _format_targets(targets: dict | list, mr_type: str) -> str:
-    """Format targets dict/list into an injectable context block."""
-    try:
-        if isinstance(targets, dict):
-            items = targets.get("targets", targets.get("items", []))
-        else:
-            items = targets
-
-        if not items:
-            return ""
-
-        lines = [f"\n[SoM Targets | {mr_type}]"]
-        for i, item in enumerate(items[:8], 1):
-            if isinstance(item, dict):
-                label = item.get("label") or item.get("name") or item.get("target", "")
-                desc = item.get("description") or item.get("desc", "")
-                lines.append(f"  {i}. {label}" + (f" — {desc}" if desc else ""))
-            else:
-                lines.append(f"  {i}. {item}")
-        lines.append("[/SoM Targets]\n")
-        return "\n".join(lines)
-    except Exception:
-        return ""
+        return PrepResult(None, "", error="som_pipeline timed out (>45s)")
+    except Exception as exc:
+        return PrepResult(None, "", error=f"phase1 exception: {exc}")
 
 
 # ── Phase 2: post-LLM outcome logging ─────────────────────────────────────────
@@ -181,16 +316,13 @@ def _count_outcomes() -> int:
     if not _OUTCOMES_JSONL.exists():
         return 0
     try:
-        return sum(1 for line in _OUTCOMES_JSONL.read_text().splitlines() if line.strip())
+        return sum(1 for line in _OUTCOMES_JSONL.read_text(encoding="utf-8").splitlines() if line.strip())
     except Exception:
         return 0
 
 
 def _trigger_optimizer_bg() -> None:
-    """
-    Launch mr_als_runner.py --phase 4,5 --force in a background subprocess.
-    Daemon thread — does not block caller. Silent on any error.
-    """
+    """Launch mr_als_runner.py --phase 4,5 --force in a background subprocess."""
     if not _RUNNER_PATH.exists():
         return
 
@@ -208,6 +340,29 @@ def _trigger_optimizer_bg() -> None:
     t.start()
 
 
+def run_phase2(
+    request_id: str,
+    task_type: str,
+    task_text: str,
+    som_state_dir: Optional[Path],
+    final_response: str,
+    t0: float,
+    routing_artifact_version: str = "static-default",
+    session_id: Optional[str] = None,
+) -> None:
+    """Run SoM completion + outcome logging synchronously."""
+    _do_phase2(
+        request_id,
+        task_type,
+        task_text,
+        som_state_dir,
+        final_response,
+        t0,
+        routing_artifact_version,
+        session_id,
+    )
+
+
 def run_phase2_async(
     request_id: str,
     task_type: str,
@@ -218,18 +373,19 @@ def run_phase2_async(
     routing_artifact_version: str = "static-default",
     session_id: Optional[str] = None,
 ) -> None:
-    """
-    Spawn a background daemon thread that:
-      1. Writes final_response to output.md (if agent didn't write it already)
-      2. Runs the complete SoM pipeline (ADV_PASS + evidence_contract)
-      3. Logs the routing outcome (outcome_quality, latency_ms)
-      4. Checks threshold → triggers optimizer if needed
+    """Run SoM completion + outcome logging in a background daemon thread."""
 
-    Never blocks the caller. Never raises.
-    """
     def _worker():
-        _do_phase2(request_id, task_type, task_text, som_state_dir,
-                   final_response, t0, routing_artifact_version, session_id)
+        _do_phase2(
+            request_id,
+            task_type,
+            task_text,
+            som_state_dir,
+            final_response,
+            t0,
+            routing_artifact_version,
+            session_id,
+        )
 
     t = threading.Thread(target=_worker, daemon=True, name=f"mr-p2-{request_id[:8]}")
     t.start()
@@ -245,75 +401,97 @@ def _do_phase2(
     routing_artifact_version: str,
     session_id: Optional[str],
 ) -> None:
-    """Inner blocking implementation of Phase 2. Runs in background thread."""
+    """Inner blocking implementation of Phase 2. Runs in a background thread."""
     latency_ms = round((time.time() - t0) * 1000, 1)
-    outcome_quality = 50.0  # default if pipeline can't run
+    som_score: Optional[float] = None
+    composite_score: Optional[float] = None
+    eop_score: Optional[float] = None
+    oracle_verdict: Optional[str] = "SKIPPED"
+    adv_pass_clean: Optional[bool] = None
+    error: Optional[str] = None
+    notes: list[str] = []
 
     try:
         if som_state_dir and _SOM_PIPELINE.exists():
             out_md = som_state_dir / "output.md"
 
-            # Only write final_response if agent didn't already produce output.md
             agent_wrote = out_md.exists() and out_md.stat().st_size >= 50
             if not agent_wrote and final_response and final_response.strip():
-                out_md.write_text(final_response)
+                out_md.write_text(final_response, encoding="utf-8")
 
-            # Run complete pipeline (ADV_PASS + evidence_contract)
             som_type = _MR_TO_SOM_TYPE.get(task_type, "code")
             result = subprocess.run(
                 [
-                    sys.executable, str(_SOM_PIPELINE),
+                    sys.executable,
+                    str(_SOM_PIPELINE),
                     "--complete",
-                    "--task-type", som_type,
-                    "--state-dir", str(som_state_dir),
-                    "--output", str(out_md),
+                    "--task",
+                    task_text[:2000],
+                    "--task-type",
+                    som_type,
+                    "--task-id",
+                    som_state_dir.name,
+                    "--state-dir",
+                    str(som_state_dir),
                 ],
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=180,
             )
 
-            # Parse SoM score from output
-            if result.returncode == 0:
-                stdout = result.stdout
-                for line in stdout.splitlines():
-                    line = line.strip()
-                    # Look for JSON with score key
-                    if line.startswith("{") and "score" in line:
-                        try:
-                            d = json.loads(line)
-                            score = d.get("score") or d.get("total_score") or d.get("quality_score")
-                            if score is not None:
-                                outcome_quality = float(score)
-                                break
-                        except Exception:
-                            pass
-                    # Look for "Score: N" pattern
-                    import re
-                    m = re.search(r"(?:score|quality)[:\s]+([0-9]+\.?[0-9]*)", line, re.IGNORECASE)
-                    if m:
-                        outcome_quality = float(m.group(1))
-                        break
+            preview = (result.stderr or result.stdout or "").strip()
+            if result.returncode not in (0, 1):
+                error = f"som complete exit {result.returncode}: {preview[:200]}"
+            else:
+                data = _parse_json_payload(result.stdout)
+                som_score = _coerce_score(data.get("score"))
+                composite_score = som_score
+                oracle_verdict = data.get("oracle") or ("PASS" if data.get("passed") else "FAIL")
+                notes.append(f"som_status={data.get('status', 'unknown')}")
+                notes.append(f"artifact={routing_artifact_version}")
+                if session_id:
+                    notes.append(f"session={session_id}")
+                if result.returncode == 1:
+                    notes.append("som_returncode=1")
 
-    except Exception:
-        pass  # never raise from background thread
+            evidence_valid, evidence_preview = _validate_evidence(som_state_dir)
+            if evidence_valid is not None:
+                notes.append(f"evidence_valid={str(evidence_valid).lower()}")
+                if not evidence_valid and evidence_preview:
+                    notes.append(f"evidence={evidence_preview}")
 
-    # Log outcome
+            if task_type in _ADV_TASK_TYPES and out_md.exists():
+                adv_pass_clean, adv_data, adv_preview = _run_adv_pass(task_text, som_state_dir, out_md)
+                if adv_pass_clean is not None:
+                    eop_score = 100.0 if adv_pass_clean else 0.0
+                    notes.append(f"adv_pass_clean={str(adv_pass_clean).lower()}")
+                    if adv_data is not None:
+                        notes.append(f"adv_findings={len(adv_data.get('findings', []))}")
+                    elif adv_preview:
+                        notes.append(f"adv_preview={adv_preview}")
+        else:
+            error = "phase2 skipped: missing som_state_dir or som_pipeline"
+    except Exception as exc:
+        error = f"phase2 exception: {exc}"
+
     lw = _load_log_writer()
     if lw and hasattr(lw, "log_routing_outcome"):
         try:
             lw.log_routing_outcome(
                 request_id=request_id,
                 task_type=task_type,
-                outcome_quality=outcome_quality,
+                composite_score=composite_score,
+                som_score=som_score,
+                eop_score=eop_score,
+                oracle_verdict=oracle_verdict,
+                adv_pass_clean=adv_pass_clean,
                 latency_ms=latency_ms,
-                routing_artifact_version=routing_artifact_version,
-                session_id=session_id,
+                error=error,
+                notes=" | ".join(notes) if notes else None,
             )
         except Exception:
             pass
 
-    # Threshold trigger: every 10 outcomes → optimizer
     try:
         n = _count_outcomes()
         if n >= 10 and n % 10 == 0:
@@ -324,28 +502,32 @@ def _do_phase2(
 
 # ── Convenience: log outcome only (no SoM pipeline) ───────────────────────────
 
-def log_outcome_only(
+def run_outcome_only(
     request_id: str,
     task_type: str,
     t0: float,
     routing_artifact_version: str = "static-default",
     session_id: Optional[str] = None,
 ) -> None:
-    """
-    Log a routing outcome without running the SoM pipeline.
-    Used when Phase 1 prep was skipped (short task, low confidence).
-    """
+    """Log an outcome when SoM phase 1/2 was skipped."""
     latency_ms = round((time.time() - t0) * 1000, 1)
     lw = _load_log_writer()
     if lw and hasattr(lw, "log_routing_outcome"):
         try:
+            notes = [f"artifact={routing_artifact_version}", "phase=outcome-only"]
+            if session_id:
+                notes.append(f"session={session_id}")
             lw.log_routing_outcome(
                 request_id=request_id,
                 task_type=task_type,
-                outcome_quality=50.0,  # unknown — no SoM score
+                composite_score=50.0,
+                som_score=None,
+                eop_score=None,
+                oracle_verdict="SKIPPED",
+                adv_pass_clean=None,
                 latency_ms=latency_ms,
-                routing_artifact_version=routing_artifact_version,
-                session_id=session_id,
+                error=None,
+                notes=" | ".join(notes),
             )
         except Exception:
             pass

@@ -84,6 +84,7 @@ class RouteDecision:
     primary: str
     secondary: Optional[str]
     budget_multiplier: float
+    routing_artifact_version: str = "static-default"
     bypassed: bool = False
     bypass_reason: str = ""
 
@@ -198,6 +199,7 @@ def make_route_decision(
             primary=_PRIMARY.get(task_type, "som"),
             secondary=_SECONDARY.get(task_type),
             budget_multiplier=_BUDGET.get(task_type, 1.0),
+            routing_artifact_version=_artifact_version,
         )
     except Exception as e:
         decision = RouteDecision(
@@ -209,6 +211,7 @@ def make_route_decision(
             primary="som",
             secondary=None,
             budget_multiplier=1.0,
+            routing_artifact_version=_artifact_version,
             bypassed=True,
             bypass_reason=f"classify failed: {e}",
         )
@@ -228,6 +231,7 @@ def make_route_decision(
                 session_id=session_id,
                 request_id=rid,
                 routing_artifact_version=_artifact_version,
+                active_candidate_id=_artifact_version,
             )
         except Exception:
             pass

@@ -21,7 +21,7 @@ Category = Literal["code", "audit", "research", "production", "integration", "de
 # ── Keyword maps (order matters — first match wins on tie-break) ─────────────
 _RULES: list[tuple[Category, list[str]]] = [
     ("audit", [
-        r"\baudit\b", r"\breview\b", r"\bcheck\b", r"\bsecurity\b", r"\bvulner",
+        r"\baudit\b", r"\bsecurity\b", r"\bvulner",
         r"\bpentest\b", r"\bscan\b", r"\bcve\b", r"\bleak\b", r"\bexploit\b",
         r"\bthreat\b", r"\bcompli", r"\bsast\b", r"\bdast\b",
     ]),
@@ -85,7 +85,7 @@ _RULES: list[tuple[Category, list[str]]] = [
 _MODE_RULES: list[tuple[str, list[str]]] = [
     ("urgent",  [r"\burgent\b", r"\basap\b", r"\bcrash\b", r"\bdown\b", r"\bbroken\b"]),
     ("review",  [r"\breview\b", r"\bcheck\b", r"\blook.?at\b", r"\bverify\b"]),
-    ("plan",    [r"\bplan\b", r"\bdesign\b", r"\barchitect\b", r"\bpropose\b", r"\bstrategy\b",
+    ("plan",    [r"\bplan\b", r"\barchitect\b", r"\bpropose\b", r"\bstrategy\b",
                 r"\bbest.approach\b", r"\bbest.way\b", r"\brecommend\b", r"\badvise\b",
                 r"\bapproach\b", r"\bshould.i\b", r"\bwhat.would\b", r"\bhow.to.approach\b",
                 r"\boutline\b", r"\bsteps.to\b", r"\bhow.to.build\b", r"\bhow.to.set.?up\b"]),

@@ -7800,6 +7800,7 @@ class AIAgent:
         self._mr_start_time = None
         self._mr_som_state_dir = None
         self._mr_original_task = None
+        self._mr_routing_artifact_version = None
         if (
             user_message
             and len(user_message) >= 10
@@ -7824,6 +7825,7 @@ class AIAgent:
                 self._mr_task_type = _mr_dec.type
                 self._mr_start_time = _mr_t0
                 self._mr_original_task = _mr_original
+                self._mr_routing_artifact_version = getattr(_mr_dec, "routing_artifact_version", None)
                 # Phase 1: generate SoM targets (fast, rule-based — no LLM)
                 if len(_mr_original) >= 40 and _mr_dec.confidence >= 0.35:
                     try:
@@ -10690,6 +10692,7 @@ class AIAgent:
         if _mr_rid and final_response and final_response.strip():
             try:
                 from gateway.meta_router_executor import (
+                    run_phase2 as _mr_p2,
                     run_phase2_async as _mr_p2_async,
                     run_outcome_only as _mr_out_only,
                 )
@@ -10697,11 +10700,17 @@ class AIAgent:
                 _mr_tt = getattr(self, "_mr_task_type", None) or "research"
                 _mr_t0 = getattr(self, "_mr_start_time", None) or 0.0
                 _mr_otask = getattr(self, "_mr_original_task", None) or ""
+                _mr_art = getattr(self, "_mr_routing_artifact_version", None) or "static-default"
+                _mr_sid = getattr(self, "session_id", None)
                 if _mr_sdir and _mr_otask:
-                    _mr_p2_async(_mr_rid, _mr_tt, _mr_otask, _mr_sdir,
-                                 final_response, _mr_t0)
+                    if getattr(self, "platform", None) == "cli":
+                        _mr_p2(_mr_rid, _mr_tt, _mr_otask, _mr_sdir,
+                               final_response, _mr_t0, _mr_art, _mr_sid)
+                    else:
+                        _mr_p2_async(_mr_rid, _mr_tt, _mr_otask, _mr_sdir,
+                                     final_response, _mr_t0, _mr_art, _mr_sid)
                 else:
-                    _mr_out_only(_mr_rid, _mr_tt, _mr_t0)
+                    _mr_out_only(_mr_rid, _mr_tt, _mr_t0, _mr_art, _mr_sid)
             except Exception:
                 pass
             finally:
@@ -10710,6 +10719,7 @@ class AIAgent:
                 self._mr_task_type = None
                 self._mr_start_time = None
                 self._mr_original_task = None
+                self._mr_routing_artifact_version = None
 
         return result
 
