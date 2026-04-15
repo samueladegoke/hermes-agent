@@ -33,7 +33,7 @@ class TestDoctorPlatformHints:
 
 class TestProviderEnvDetection:
     def test_detects_openai_api_key(self):
-        content = "OPENAI_BASE_URL=http://localhost:1234/v1\nOPENAI_API_KEY=***"
+        content = "OPENAI_BASE_URL=http://localhost:1234/v1\nOPENAI_API_KEY=***\n"
         assert _has_provider_env_config(content)
 
     def test_detects_custom_endpoint_without_openrouter_key(self):
@@ -41,7 +41,11 @@ class TestProviderEnvDetection:
         assert _has_provider_env_config(content)
 
     def test_detects_tavily_api_key(self):
-        content = "TAVILY_API_KEY=tvly-dev-example\n"
+        content = "TAVILY_API_KEY=tvly-d...e\n"
+        assert _has_provider_env_config(content)
+
+    def test_detects_kimi_cn_api_key(self):
+        content = "KIMI_CN_API_KEY=***\n"
         assert _has_provider_env_config(content)
 
     def test_returns_false_when_no_provider_settings(self):
@@ -296,3 +300,104 @@ def test_run_doctor_termux_does_not_mark_browser_available_without_agent_browser
     assert "system dependency not met" in out
     assert "agent-browser is not installed (expected in the tested Termux path)" in out
     assert "npm install -g agent-browser && agent-browser install" in out
+
+
+def test_run_doctor_kimi_cn_env_is_detected_and_probe_is_null_safe(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
+    (home / ".env").write_text("KIMI_CN_API_KEY=sk-test\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir(exist_ok=True)
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    monkeypatch.setenv("KIMI_CN_API_KEY", "sk-test")
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    try:
+        from hermes_cli import auth as _auth_mod
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+    except Exception:
+        pass
+
+    calls = []
+
+    def fake_get(url, headers=None, timeout=None):
+        calls.append((url, headers, timeout))
+        return types.SimpleNamespace(status_code=200)
+
+    import httpx
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+    out = buf.getvalue()
+
+    assert "API key or custom endpoint configured" in out
+    assert "Kimi / Moonshot (China)" in out
+    assert "str expected, not NoneType" not in out
+    assert any(url == "https://api.moonshot.cn/v1/models" for url, _, _ in calls)
+
+
+@pytest.mark.parametrize("base_url", [None, "https://opencode.ai/zen/go/v1"])
+def test_run_doctor_opencode_go_skips_invalid_models_probe(monkeypatch, tmp_path, base_url):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
+    (home / ".env").write_text("OPENCODE_GO_API_KEY=***\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir(exist_ok=True)
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    monkeypatch.setenv("OPENCODE_GO_API_KEY", "sk-test")
+    if base_url:
+        monkeypatch.setenv("OPENCODE_GO_BASE_URL", base_url)
+    else:
+        monkeypatch.delenv("OPENCODE_GO_BASE_URL", raising=False)
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    try:
+        from hermes_cli import auth as _auth_mod
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+    except ImportError:
+        pass
+
+    calls = []
+
+    def fake_get(url, headers=None, timeout=None):
+        calls.append((url, headers, timeout))
+        return types.SimpleNamespace(status_code=200)
+
+    import httpx
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+    out = buf.getvalue()
+
+    assert any(
+        "OpenCode Go" in line and "(key configured)" in line
+        for line in out.splitlines()
+    )
+    assert not any(url == "https://opencode.ai/zen/go/v1/models" for url, _, _ in calls)
+    assert not any("opencode" in url.lower() and "models" in url.lower() for url, _, _ in calls)
