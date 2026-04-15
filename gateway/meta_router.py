@@ -142,7 +142,17 @@ def classify(text: str) -> RouteResult:
             break
 
     directive = f"[META-ROUTER | {best_cat} | {mode}]"
-    return RouteResult(type=best_cat, mode=mode, confidence=confidence, directive=directive)
+    result = RouteResult(type=best_cat, mode=mode, confidence=confidence, directive=directive)
+    if result.confidence < 0.5:
+        try:
+            from gateway.meta_router_llm import llm_classify
+        except Exception:
+            llm_classify = None
+        if llm_classify is not None:
+            llm_result = llm_classify(text, result)
+            if llm_result is not None:
+                return llm_result
+    return result
 
 
 def prepend_directive(text: str, result: RouteResult) -> str:

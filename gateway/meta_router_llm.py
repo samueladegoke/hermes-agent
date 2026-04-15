@@ -1,0 +1,142 @@
+"""Best-effort LLM fallback for ambiguous meta-router classifications."""
+from __future__ import annotations
+
+import json
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from gateway.meta_router import RouteResult
+
+
+_LLM_MODEL = "gpt-5.4-mini"
+_LLM_TIMEOUT_SECONDS = 8.0
+_VALID_TYPES = ("code", "audit", "research", "production", "integration", "config", "design")
+_VALID_MODES = ("execute", "plan", "review", "urgent")
+
+
+def _build_system_prompt() -> str:
+    return (
+        "You are a task router for an AI coding agent. "
+        "Choose exactly one valid type and one valid mode. "
+        "Respond with valid JSON only."
+    )
+
+
+def _build_user_prompt(task: str, keyword_result) -> str:
+    return (
+        f"Task:\n{task}\n\n"
+        f"Valid types: {', '.join(_VALID_TYPES)}\n"
+        f"Valid modes: {', '.join(_VALID_MODES)}\n\n"
+        "Keyword hint:\n"
+        f"keyword classifier suggested {keyword_result.type} "
+        f"with confidence {keyword_result.confidence:.2f} — do you agree?\n\n"
+        "Reply with JSON only using this schema:\n"
+        '{"type": "...", "mode": "...", "confidence": 0.0, "reasoning": "one sentence"}'
+    )
+
+
+def _extract_output_text(response) -> str:
+    text = getattr(response, "output_text", None)
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+
+    output = getattr(response, "output", None)
+    if isinstance(output, list):
+        chunks: list[str] = []
+        for item in output:
+            content = getattr(item, "content", None)
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                part_text = getattr(part, "text", None)
+                if isinstance(part_text, str) and part_text.strip():
+                    chunks.append(part_text.strip())
+        if chunks:
+            return "\n".join(chunks)
+
+    if isinstance(response, dict):
+        text = response.get("output_text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+
+    return ""
+
+
+def _parse_json_payload(text: str) -> dict:
+    payload = (text or "").strip()
+    if not payload:
+        raise ValueError("empty JSON payload")
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        start = payload.find("{")
+        end = payload.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        return json.loads(payload[start : end + 1])
+
+
+def _coerce_confidence(value) -> float | None:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return None
+    if confidence < 0.0:
+        return 0.0
+    if confidence > 1.0:
+        return 1.0
+    return confidence
+
+
+def _build_client(timeout_seconds: float):
+    from openai import OpenAI
+
+    from agent.auxiliary_client import _to_openai_base_url
+    from hermes_cli.auth import resolve_codex_runtime_credentials
+
+    creds = resolve_codex_runtime_credentials()
+    api_key = str(creds.get("api_key") or "").strip()
+    if not api_key:
+        return None
+    base_url = _to_openai_base_url(str(creds.get("base_url") or "").strip())
+    return OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_seconds)
+
+
+def llm_classify(task: str, keyword_result) -> "RouteResult | None":
+    """Return an LLM routing decision for ambiguous tasks, or None on failure."""
+    if not task or not str(task).strip():
+        return None
+
+    try:
+        client = _build_client(_LLM_TIMEOUT_SECONDS)
+        if client is None:
+            return None
+
+        response = client.responses.create(
+            model=_LLM_MODEL,
+            instructions=_build_system_prompt(),
+            input=_build_user_prompt(task, keyword_result),
+            reasoning={"effort": "xhigh", "summary": "auto"},
+            service_tier="priority",
+            text={"verbosity": "low"},
+            store=False,
+        )
+        payload = _parse_json_payload(_extract_output_text(response))
+    except Exception:
+        return None
+
+    result_type = str(payload.get("type") or "").strip().lower()
+    result_mode = str(payload.get("mode") or "").strip().lower()
+    confidence = _coerce_confidence(payload.get("confidence"))
+    if result_type not in _VALID_TYPES or result_mode not in _VALID_MODES or confidence is None:
+        return None
+
+    from gateway.meta_router import RouteResult
+
+    directive = f"[META-ROUTER | {result_type} | {result_mode}]"
+    return RouteResult(
+        type=result_type,
+        mode=result_mode,
+        confidence=confidence,
+        directive=directive,
+    )
