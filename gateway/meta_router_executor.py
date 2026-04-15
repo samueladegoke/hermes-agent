@@ -443,19 +443,37 @@ def _scaffold_evidence(state_dir: Path, task_text: str) -> Optional[str]:
 
 
 def _validate_evidence(state_dir: Path) -> tuple[Optional[bool], str]:
-    if not _EVIDENCE_CONTRACT.exists():
-        return None, ""
     try:
-        result = subprocess.run(
-            [sys.executable, str(_EVIDENCE_CONTRACT), "--validate", "--state-dir", str(state_dir)],
-            capture_output=True,
-            text=True,
-            timeout=30,
+        output_path = Path(state_dir) / "output.md"
+        if not output_path.exists():
+            return None, ""
+        output_excerpt = output_path.read_text(encoding="utf-8")[:800].strip()
+        if not output_excerpt:
+            return None, ""
+
+        task_path = Path(state_dir) / "task.txt"
+        task_excerpt = task_path.read_text(encoding="utf-8")[:200].strip() if task_path.exists() else ""
+        prompt = (
+            "Did this AI agent response provide genuine evidence of completing the task? "
+            f"Task: {task_excerpt}. "
+            f"Response excerpt: {output_excerpt}. "
+            'Reply with JSON: {"valid": true/false, "confidence": 0.0-1.0, "reason": "one sentence"}'
         )
-        preview = (result.stderr or result.stdout or "").strip()
-        return result.returncode == 0, preview[:200]
-    except Exception as exc:
-        return None, f"evidence validate exception: {exc}"
+        data = _call_llm_json_prompt(
+            "You judge whether an AI agent response contains genuine completion evidence. Respond with valid JSON only.",
+            prompt,
+            timeout_seconds=8.0,
+        )
+        if not isinstance(data, dict):
+            return None, ""
+
+        valid = data.get("valid")
+        if not isinstance(valid, bool):
+            return None, ""
+        reason = str(data.get("reason") or "").strip()
+        return valid, reason
+    except Exception:
+        return None, ""
 
 
 

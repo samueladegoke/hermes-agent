@@ -5,6 +5,49 @@ from types import SimpleNamespace
 import gateway.meta_router_executor as executor
 
 
+
+def test_validate_evidence_uses_llm_result_when_available(monkeypatch, tmp_path):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "output.md").write_text(
+        "I used branch sam/custom-hermes, resolved the conflict, and ran the tests.",
+        encoding="utf-8",
+    )
+    (state_dir / "task.txt").write_text("Resolve the merge conflict and report the branch.", encoding="utf-8")
+
+    calls = []
+
+    def fake_llm(instructions, prompt, timeout_seconds):
+        calls.append((instructions, prompt, timeout_seconds))
+        return {"valid": True, "confidence": 0.88, "reason": "The response cites concrete branch and verification details."}
+
+    monkeypatch.setattr(executor, "_call_llm_json_prompt", fake_llm)
+    monkeypatch.setattr(executor, "_EVIDENCE_CONTRACT", tmp_path / "missing_evidence_contract.py")
+
+    valid, reason = executor._validate_evidence(state_dir)
+
+    assert calls, "expected LLM evidence validator to run"
+    assert valid is True
+    assert reason == "The response cites concrete branch and verification details."
+
+
+
+def test_validate_evidence_preserves_none_fallback_when_llm_fails(monkeypatch, tmp_path):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "output.md").write_text("I resolved it.", encoding="utf-8")
+    (state_dir / "task.txt").write_text("Resolve the merge conflict and report the branch.", encoding="utf-8")
+
+    monkeypatch.setattr(executor, "_call_llm_json_prompt", lambda *args, **kwargs: None)
+    monkeypatch.setattr(executor, "_EVIDENCE_CONTRACT", tmp_path / "missing_evidence_contract.py")
+
+    valid, reason = executor._validate_evidence(state_dir)
+
+    assert valid is None
+    assert reason == ""
+
+
+
 def test_enhance_fix_prompt_overwrites_file_with_task_specific_text(monkeypatch, tmp_path):
     fix_prompt = tmp_path / "fix_prompt.md"
     fix_prompt.write_text("add edge cases", encoding="utf-8")
