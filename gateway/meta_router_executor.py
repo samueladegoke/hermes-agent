@@ -810,6 +810,7 @@ def run_outcome_only(
                 som_score=None,
                 eop_score=None,
                 oracle_verdict="SKIPPED",
+                outcome_quality=None,
                 adv_pass_clean=None,
                 latency_ms=latency_ms,
                 error=None,

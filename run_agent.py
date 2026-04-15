@@ -10720,9 +10720,17 @@ class AIAgent:
                         try:
                             from pathlib import Path as _MRPath
                             _fix_instructions = _MRPath(_mr_phase2.fix_prompt_path).read_text(encoding="utf-8")
+                            _score_str = (
+                                f"{_mr_phase2.score:.0f}"
+                                if _mr_phase2.score is not None else "?"
+                            )
+                            _thresh_str = (
+                                f"{_mr_phase2.threshold:.0f}"
+                                if _mr_phase2.threshold is not None else "?"
+                            )
                             _fix_prefix = (
                                 f"[META-ROUTER | CORRECTION PASS {_mr_fix_pass}/{_MR_MAX_FIX_PASSES}]\n"
-                                f"Score: {_mr_phase2.score:.0f}/{_mr_phase2.threshold:.0f} — "
+                                f"Score: {_score_str}/{_thresh_str} — "
                                 f"revision needed before delivery.\n\n"
                                 f"{_fix_instructions}\n\n"
                                 f"Revise and restate your complete response below."
@@ -10737,6 +10745,16 @@ class AIAgent:
                             _fix_response = _fix_result.get("final_response", "").strip()
                             if _fix_response:
                                 final_response = _fix_response
+                                # output.md already exists from the first evaluation.
+                                # Explicitly overwrite it so SoM scores the corrected
+                                # text — the write-guard in run_phase2_async skips the
+                                # write when the file is already present.
+                                try:
+                                    (_MRPath(_mr_sdir) / "output.md").write_text(
+                                        final_response, encoding="utf-8"
+                                    )
+                                except Exception:
+                                    pass
                                 # Re-evaluate with the corrected output
                                 _mr_phase2 = _mr_p2(
                                     _mr_rid, _mr_tt, _mr_otask, _mr_sdir,
