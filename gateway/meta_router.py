@@ -31,6 +31,7 @@ _RULES: list[tuple[Category, list[str]]] = [
         r"\bmockup\b", r"\bfont\b", r"\bcolor\b", r"\bresponsive\b", r"\banimation\b",
         r"\btailwind\b", r"\bdark.?mode\b", r"\bdashboard\b", r"\bvisual\b",
         r"\bpanel\b", r"\bcard\b", r"\bmodal\b", r"\btooltip\b",
+        r"\barchitecture\b", r"\bdiagram\b", r"\bblueprint\b", r"\bschema\b",
     ]),
     ("research", [
         r"\bresearch\b", r"\bfind\b", r"\bwhat is\b", r"\bhow does\b",
@@ -86,7 +87,8 @@ _MODE_RULES: list[tuple[str, list[str]]] = [
     ("review",  [r"\breview\b", r"\bcheck\b", r"\blook.?at\b", r"\bverify\b"]),
     ("plan",    [r"\bplan\b", r"\bdesign\b", r"\barchitect\b", r"\bpropose\b", r"\bstrategy\b",
                 r"\bbest.approach\b", r"\bbest.way\b", r"\brecommend\b", r"\badvise\b",
-                r"\bapproach\b", r"\bshould.i\b", r"\bwhat.would\b", r"\bhow.to.approach\b"]),
+                r"\bapproach\b", r"\bshould.i\b", r"\bwhat.would\b", r"\bhow.to.approach\b",
+                r"\boutline\b", r"\bsteps.to\b", r"\bhow.to.build\b", r"\bhow.to.set.?up\b"]),
     ("execute", []),   # default
 ]
 
