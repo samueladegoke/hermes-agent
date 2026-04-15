@@ -14,6 +14,7 @@ so it must be loaded via importlib.util, not a regular package import.
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 import uuid
 from dataclasses import dataclass
@@ -87,6 +88,62 @@ class RouteDecision:
     bypass_reason: str = ""
 
 
+# ── Artifact-aware weighted classifier ────────────────────────────────────────
+
+def _classify_with_overrides(text: str, overrides: dict, _RULES, _MODE_RULES) -> tuple[str, str, float]:
+    """
+    Apply artifact keyword_weight_adjustments + type_priority to a raw classify.
+    Returns (task_type, mode, confidence).
+    Falls back to "code" / 0.5 when all scores are zero.
+    """
+    weight_adj = overrides.get("keyword_weight_adjustments", {})
+    type_priority = overrides.get("type_priority", [])
+    min_conf = overrides.get("confidence_thresholds", {}).get("min_confidence_to_route", 0.0)
+    lower = text.lower()
+
+    # Raw keyword scores
+    raw: dict[str, int] = {cat: 0 for cat, _ in _RULES}
+    for category, patterns in _RULES:
+        for pattern in patterns:
+            if re.search(pattern, lower):
+                raw[category] += 1
+
+    # Apply weight multipliers
+    adjusted: dict[str, float] = {
+        cat: score * weight_adj.get(cat, {}).get("weight_multiplier", 1.0)
+        for cat, score in raw.items()
+    }
+
+    # Best type with priority tie-breaking
+    def _sort_key(c: str):
+        pri = type_priority.index(c) if c in type_priority else 999
+        return (adjusted.get(c, 0.0), -pri)
+
+    best_type = max(adjusted, key=_sort_key) if adjusted else "code"
+    best_score = adjusted.get(best_type, 0.0)
+
+    if best_score <= 0:
+        best_type = "code"
+        confidence = 0.5
+    else:
+        total = sum(adjusted.values()) or 1.0
+        confidence = round(best_score / total, 3)
+
+    # Confidence threshold gate
+    if confidence < min_conf:
+        best_type = "code"
+        confidence = 0.5
+
+    # Mode inference
+    mode = "execute"
+    for m, patterns in _MODE_RULES[:-1]:
+        if any(re.search(p, lower) for p in patterns):
+            mode = m
+            break
+
+    return best_type, mode, confidence
+
+
 def make_route_decision(
     text: str,
     source: str = "cli",
@@ -95,38 +152,52 @@ def make_route_decision(
 ) -> RouteDecision:
     """
     Classify text locally (no HTTP) and return a full RouteDecision.
+    When an active artifact is deployed (Phase 3), applies its keyword weight
+    adjustments and type priority to the classification.
     Logs the routing event to routing_events.jsonl. Never raises.
     """
     _init_logger()
     rid = _make_request_id_fn() if _make_request_id_fn else str(uuid.uuid4())
 
-    # Phase 3: load adaptive routing overrides (no-op when static-default)
+    # Phase 3: load adaptive routing overrides
     _artifact_version = "static-default"
-    _type_priority_override: list[str] = []
+    _overrides: dict = {}
     try:
         if _LOAD_ROUTING_PATH.exists():
             spec3 = importlib.util.spec_from_file_location("_mr_load_routing", _LOAD_ROUTING_PATH)
             lar_mod = importlib.util.module_from_spec(spec3)
             spec3.loader.exec_module(lar_mod)
-            overrides = lar_mod.load_overrides()
-            _artifact_version = overrides.get("candidate_id", "static-default") or "static-default"
-            _type_priority_override = overrides.get("type_priority", [])
+            _overrides = lar_mod.load_overrides()
+            _artifact_version = _overrides.get("candidate_id", "static-default") or "static-default"
     except Exception:
         pass
 
-    # Direct classify — no HTTP round-trip
+    # Classify — with artifact overrides when an artifact is active,
+    # or fall back to the base classify() when running static-default.
     try:
-        from gateway.meta_router import classify as _classify
-        result = _classify(text)
+        from gateway.meta_router import _RULES, _MODE_RULES  # type: ignore[attr-defined]
+
+        if _artifact_version != "static-default" and _overrides:
+            task_type, mode, confidence = _classify_with_overrides(text, _overrides, _RULES, _MODE_RULES)
+            # Rebuild directive in the same format as meta_router.classify()
+            directive = f"[META-ROUTER | {task_type} | {mode}]"
+        else:
+            from gateway.meta_router import classify as _classify
+            result = _classify(text)
+            task_type = result.type
+            mode = result.mode
+            confidence = result.confidence
+            directive = result.directive
+
         decision = RouteDecision(
             request_id=rid,
-            type=result.type,
-            mode=result.mode,
-            directive=result.directive,
-            confidence=result.confidence,
-            primary=_PRIMARY.get(result.type, "som"),
-            secondary=_SECONDARY.get(result.type),
-            budget_multiplier=_BUDGET.get(result.type, 1.0),
+            type=task_type,
+            mode=mode,
+            directive=directive,
+            confidence=confidence,
+            primary=_PRIMARY.get(task_type, "som"),
+            secondary=_SECONDARY.get(task_type),
+            budget_multiplier=_BUDGET.get(task_type, 1.0),
         )
     except Exception as e:
         decision = RouteDecision(
