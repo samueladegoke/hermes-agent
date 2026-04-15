@@ -7792,9 +7792,14 @@ class AIAgent:
         if isinstance(persist_user_message, str):
             persist_user_message = _sanitize_surrogates(persist_user_message)
 
-        # meta-router: pre-classify CLI messages (sam/custom-hermes)
+        # meta-router: pre-classify CLI messages — MR-ALS runtime v2
+        # Direct classify (no HTTP) + RouteDecision + event logging + SoM Phase 1.
         # Telegram already injects [META-ROUTER | type | mode] in telegram.py.
-        # For all other callers (CLI, API), classify here if no directive present.
+        self._mr_request_id = None
+        self._mr_task_type = None
+        self._mr_start_time = None
+        self._mr_som_state_dir = None
+        self._mr_original_task = None
         if (
             user_message
             and len(user_message) >= 10
@@ -7802,22 +7807,39 @@ class AIAgent:
             and not user_message.lstrip().startswith(("!", "/", "#"))
         ):
             try:
-                import urllib.request as _urllib_req
-                import json as _json_mod
-                _mr_payload = _json_mod.dumps({"text": user_message}).encode()
-                _mr_req = _urllib_req.Request(
-                    "http://127.0.0.1:3120/classify",
-                    data=_mr_payload,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
+                import time as _mr_time
+                _mr_t0 = _mr_time.time()
+                from gateway.meta_router_runtime import make_route_decision as _mr_decide
+                _mr_dec = _mr_decide(
+                    text=user_message,
+                    source="cli",
+                    surface="cli",
+                    session_id=getattr(self, "session_id", None),
                 )
-                with _urllib_req.urlopen(_mr_req, timeout=1.5) as _mr_resp:
-                    _mr_data = _json_mod.loads(_mr_resp.read())
-                _mr_type = _mr_data.get("type", "research")
-                _mr_mode = _mr_data.get("mode", "execute")
-                user_message = f"[META-ROUTER | {_mr_type} | {_mr_mode}]\n{user_message}"
+                _mr_original = user_message
+                user_message = f"{_mr_dec.directive}\n{user_message}"
+                if persist_user_message is None:
+                    persist_user_message = _mr_original
+                self._mr_request_id = _mr_dec.request_id
+                self._mr_task_type = _mr_dec.type
+                self._mr_start_time = _mr_t0
+                self._mr_original_task = _mr_original
+                # Phase 1: generate SoM targets (fast, rule-based — no LLM)
+                if len(_mr_original) >= 40 and _mr_dec.confidence >= 0.35:
+                    try:
+                        from gateway.meta_router_executor import run_phase1 as _mr_p1
+                        _prep = _mr_p1(_mr_original, _mr_dec.type)
+                        if _prep.phase1_ok and _prep.targets_context:
+                            self._mr_som_state_dir = _prep.state_dir
+                            user_message = (
+                                f"{_mr_dec.directive}\n\n"
+                                f"{_prep.targets_context}\n\n"
+                                f"{_mr_original}"
+                            )
+                    except Exception:
+                        pass  # Phase 1 failure is non-fatal
             except Exception:
-                pass  # meta-router unavailable — proceed without directive
+                pass  # meta-router runtime unavailable — proceed without directive
 
         # Store stream callback for _interruptible_api_call to pick up
         self._stream_callback = stream_callback
@@ -10662,6 +10684,32 @@ class AIAgent:
             )
         except Exception as exc:
             logger.warning("on_session_end hook failed: %s", exc)
+
+        # MR-ALS post-turn: SoM Phase 2 scoring + outcome logging (background)
+        _mr_rid = getattr(self, "_mr_request_id", None)
+        if _mr_rid and final_response and final_response.strip():
+            try:
+                from gateway.meta_router_executor import (
+                    run_phase2_async as _mr_p2_async,
+                    run_outcome_only as _mr_out_only,
+                )
+                _mr_sdir = getattr(self, "_mr_som_state_dir", None)
+                _mr_tt = getattr(self, "_mr_task_type", None) or "research"
+                _mr_t0 = getattr(self, "_mr_start_time", None) or 0.0
+                _mr_otask = getattr(self, "_mr_original_task", None) or ""
+                if _mr_sdir and _mr_otask:
+                    _mr_p2_async(_mr_rid, _mr_tt, _mr_otask, _mr_sdir,
+                                 final_response, _mr_t0)
+                else:
+                    _mr_out_only(_mr_rid, _mr_tt, _mr_t0)
+            except Exception:
+                pass
+            finally:
+                self._mr_request_id = None
+                self._mr_som_state_dir = None
+                self._mr_task_type = None
+                self._mr_start_time = None
+                self._mr_original_task = None
 
         return result
 
