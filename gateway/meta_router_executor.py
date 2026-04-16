@@ -383,7 +383,13 @@ def format_routed_response(raw_response: str, phase2: Phase2Result, directive: s
         receipt_lines.append("Score gate: PASS")
     elif phase2.delivery_gate_passed is False:
         if phase2.score is not None and phase2.threshold is not None:
-            receipt_lines.append(f"Score gate: FAIL ({phase2.score:.1f} < {phase2.threshold:.1f})")
+            if phase2.score < phase2.threshold:
+                receipt_lines.append(f"Score gate: FAIL ({phase2.score:.1f} < {phase2.threshold:.1f})")
+            else:
+                receipt_lines.append(
+                    f"Score gate: FAIL (delivery gate rejected; "
+                    f"score {phase2.score:.1f} met threshold {phase2.threshold:.1f})"
+                )
         else:
             receipt_lines.append("Score gate: FAIL")
     receipt_lines.append(f"Oracle: {phase2.oracle_verdict}")
