@@ -5,6 +5,45 @@ from types import SimpleNamespace
 import gateway.meta_router_executor as executor
 
 
+class _FakeResponsesClient:
+    def __init__(self, output_text):
+        self.output_text = output_text
+        self.kwargs = None
+
+    def stream(self, **kwargs):
+        self.kwargs = kwargs
+        return _FakeStream(self.output_text)
+
+
+class _FakeStream:
+    def __init__(self, output_text):
+        self.output_text = output_text
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def __iter__(self):
+        yield SimpleNamespace(type="response.output_text.delta", delta=self.output_text)
+
+    def get_final_response(self):
+        return SimpleNamespace(output_text=self.output_text)
+
+
+
+def test_call_llm_json_prompt_sends_responses_input_as_list(monkeypatch):
+    fake_client = _FakeResponsesClient('{"valid": true, "reason": "ok"}')
+    monkeypatch.setattr(executor, "_build_llm_client", lambda timeout_seconds: SimpleNamespace(responses=fake_client))
+
+    payload = executor._call_llm_json_prompt("instructions", "prompt text", 8.0)
+
+    assert payload == {"valid": True, "reason": "ok"}
+    assert isinstance(fake_client.kwargs["input"], list)
+    assert fake_client.kwargs["input"][0]["content"][0]["text"] == "prompt text"
+
+
 
 def test_validate_evidence_uses_llm_result_when_available(monkeypatch, tmp_path):
     state_dir = tmp_path / "state"

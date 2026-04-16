@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -12,6 +13,32 @@ _LLM_MODEL = "gpt-5.4-mini"
 _LLM_TIMEOUT_SECONDS = 8.0
 _VALID_TYPES = ("code", "audit", "research", "production", "integration", "config", "design")
 _VALID_MODES = ("execute", "plan", "review", "urgent")
+
+
+def _responses_text_input(prompt: str) -> list[dict]:
+    return [{"role": "user", "content": [{"type": "input_text", "text": str(prompt or "")}] }]
+
+
+
+def _run_with_timeout(fn, timeout_seconds: float):
+    result: dict[str, object] = {}
+    error: dict[str, BaseException] = {}
+
+    def _target():
+        try:
+            result["value"] = fn()
+        except BaseException as exc:  # pragma: no cover - defensive capture
+            error["exc"] = exc
+
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+    thread.join(timeout_seconds)
+    if thread.is_alive():
+        return None
+    if "exc" in error:
+        raise error["exc"]
+    return result.get("value")
+
 
 
 def _build_system_prompt() -> str:
@@ -62,6 +89,36 @@ def _extract_output_text(response) -> str:
     return ""
 
 
+def _stream_text_response(client, *, instructions: str, prompt: str) -> str:
+    def _run() -> str:
+        deltas: list[str] = []
+        with client.responses.stream(
+            model=_LLM_MODEL,
+            instructions=instructions,
+            input=_responses_text_input(prompt),
+            reasoning={"effort": "xhigh", "summary": "auto"},
+            service_tier="priority",
+            text={"verbosity": "low"},
+            store=False,
+        ) as stream:
+            for event in stream:
+                event_type = getattr(event, "type", "")
+                if event_type == "response.output_text.delta":
+                    delta = getattr(event, "delta", None)
+                    if isinstance(delta, str) and delta:
+                        deltas.append(delta)
+            response = stream.get_final_response()
+        text = "".join(deltas).strip()
+        if text:
+            return text
+        return _extract_output_text(response)
+
+    streamed = _run_with_timeout(_run, _LLM_TIMEOUT_SECONDS)
+    if not isinstance(streamed, str):
+        return ""
+    return streamed
+
+
 def _parse_json_payload(text: str) -> dict:
     payload = (text or "").strip()
     if not payload:
@@ -92,13 +149,13 @@ def _build_client(timeout_seconds: float):
     from openai import OpenAI
 
     from agent.auxiliary_client import _to_openai_base_url
-    from hermes_cli.auth import resolve_codex_runtime_credentials
+    from hermes_cli.runtime_provider import resolve_runtime_provider
 
-    creds = resolve_codex_runtime_credentials()
-    api_key = str(creds.get("api_key") or "").strip()
+    runtime = resolve_runtime_provider(requested="openai-codex")
+    api_key = str(runtime.get("api_key") or "").strip()
     if not api_key:
         return None
-    base_url = _to_openai_base_url(str(creds.get("base_url") or "").strip())
+    base_url = _to_openai_base_url(str(runtime.get("base_url") or "").strip())
     return OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_seconds)
 
 
@@ -112,16 +169,13 @@ def llm_classify(task: str, keyword_result) -> "RouteResult | None":
         if client is None:
             return None
 
-        response = client.responses.create(
-            model=_LLM_MODEL,
-            instructions=_build_system_prompt(),
-            input=_build_user_prompt(task, keyword_result),
-            reasoning={"effort": "xhigh", "summary": "auto"},
-            service_tier="priority",
-            text={"verbosity": "low"},
-            store=False,
+        payload = _parse_json_payload(
+            _stream_text_response(
+                client,
+                instructions=_build_system_prompt(),
+                prompt=_build_user_prompt(task, keyword_result),
+            )
         )
-        payload = _parse_json_payload(_extract_output_text(response))
     except Exception:
         return None
 

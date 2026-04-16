@@ -175,13 +175,13 @@ def _build_llm_client(timeout_seconds: float):
         from openai import OpenAI
 
         from agent.auxiliary_client import _to_openai_base_url
-        from hermes_cli.auth import resolve_codex_runtime_credentials
+        from hermes_cli.runtime_provider import resolve_runtime_provider
 
-        creds = resolve_codex_runtime_credentials()
-        api_key = str(creds.get("api_key") or "").strip()
+        runtime = resolve_runtime_provider(requested="openai-codex")
+        api_key = str(runtime.get("api_key") or "").strip()
         if not api_key:
             return None
-        base_url = _to_openai_base_url(str(creds.get("base_url") or "").strip())
+        base_url = _to_openai_base_url(str(runtime.get("base_url") or "").strip())
         return OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_seconds)
     except Exception:
         return None
@@ -231,21 +231,44 @@ def _parse_llm_json_payload(text: str) -> dict:
 
 
 
+def _responses_text_input(prompt: str) -> list[dict]:
+    return [{"role": "user", "content": [{"type": "input_text", "text": str(prompt or "")}] }]
+
+
+
+def _stream_llm_text(client, *, instructions: str, prompt: str) -> str:
+    deltas: list[str] = []
+    with client.responses.stream(
+        model=_LLM_MODEL,
+        instructions=instructions,
+        input=_responses_text_input(prompt),
+        reasoning={"effort": "xhigh", "summary": "auto"},
+        service_tier="priority",
+        text={"verbosity": "low"},
+        store=False,
+    ) as stream:
+        for event in stream:
+            event_type = getattr(event, "type", "")
+            if event_type == "response.output_text.delta":
+                delta = getattr(event, "delta", None)
+                if isinstance(delta, str) and delta:
+                    deltas.append(delta)
+        response = stream.get_final_response()
+    text = "".join(deltas).strip()
+    if text:
+        return text
+    return _extract_llm_output_text(response)
+
+
+
 def _call_llm_json_prompt(instructions: str, prompt: str, timeout_seconds: float) -> Optional[dict]:
     try:
         client = _build_llm_client(timeout_seconds)
         if client is None:
             return None
-        response = client.responses.create(
-            model=_LLM_MODEL,
-            instructions=instructions,
-            input=prompt,
-            reasoning={"effort": "xhigh", "summary": "auto"},
-            service_tier="priority",
-            text={"verbosity": "low"},
-            store=False,
+        return _parse_llm_json_payload(
+            _stream_llm_text(client, instructions=instructions, prompt=prompt)
         )
-        return _parse_llm_json_payload(_extract_llm_output_text(response))
     except Exception:
         return None
 
@@ -256,16 +279,7 @@ def _call_llm_text_prompt(instructions: str, prompt: str, timeout_seconds: float
         client = _build_llm_client(timeout_seconds)
         if client is None:
             return None
-        response = client.responses.create(
-            model=_LLM_MODEL,
-            instructions=instructions,
-            input=prompt,
-            reasoning={"effort": "xhigh", "summary": "auto"},
-            service_tier="priority",
-            text={"verbosity": "low"},
-            store=False,
-        )
-        text = _extract_llm_output_text(response).strip()
+        text = _stream_llm_text(client, instructions=instructions, prompt=prompt).strip()
         return text or None
     except Exception:
         return None

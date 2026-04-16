@@ -1,7 +1,9 @@
 import sys
 import types
+from types import SimpleNamespace
 
 import gateway.meta_router as meta_router
+import gateway.meta_router_llm as meta_router_llm
 
 
 LOW_CONFIDENCE_TASK = "Explain API OAuth integration config setup"
@@ -74,3 +76,52 @@ def test_classify_preserves_keyword_result_when_llm_fails(monkeypatch):
     result = meta_router.classify(LOW_CONFIDENCE_TASK)
 
     assert result == baseline
+
+
+class _FakeResponsesClient:
+    def __init__(self):
+        self.kwargs = None
+
+    def stream(self, **kwargs):
+        self.kwargs = kwargs
+        return _FakeStream('{"type": "integration", "mode": "review", "confidence": 0.9, "reasoning": "ok"}')
+
+
+class _FakeStream:
+    def __init__(self, text):
+        self.text = text
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def __iter__(self):
+        yield SimpleNamespace(type="response.output_text.delta", delta=self.text)
+
+    def get_final_response(self):
+        return SimpleNamespace(output_text=self.text)
+
+
+
+def test_llm_classify_sends_responses_input_as_list(monkeypatch):
+    fake_client = _FakeResponsesClient()
+
+    monkeypatch.setattr(meta_router_llm, "_build_client", lambda timeout_seconds: SimpleNamespace(responses=fake_client))
+
+    result = meta_router_llm.llm_classify(
+        LOW_CONFIDENCE_TASK,
+        meta_router.RouteResult(
+            type="integration",
+            mode="execute",
+            confidence=0.429,
+            directive="[META-ROUTER | integration | execute]",
+        ),
+    )
+
+    assert isinstance(fake_client.kwargs["input"], list)
+    assert fake_client.kwargs["input"][0]["role"] == "user"
+    assert fake_client.kwargs["input"][0]["content"][0]["type"] == "input_text"
+    assert result.type == "integration"
+    assert result.mode == "review"
