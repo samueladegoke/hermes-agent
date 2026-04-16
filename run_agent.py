@@ -8025,11 +8025,35 @@ class AIAgent:
                             _prep = _mr_p1(_mr_original, _mr_dec.type)
                             if _prep.phase1_ok and _prep.targets_context:
                                 self._mr_som_state_dir = _prep.state_dir
-                                user_message = (
-                                    f"{_mr_dec.directive}\n\n"
-                                    f"{_prep.targets_context}\n\n"
-                                    f"{_mr_original}"
-                                )
+                                # Phase 1b: pre-execution context brief
+                                # For research/audit/production tasks, gather relevant
+                                # context BEFORE Hermes runs so it knows where to look
+                                # rather than discovering everything through tool calls.
+                                _mr_ctx_brief = None
+                                try:
+                                    from gateway.meta_router_context import (
+                                        gather_pre_execution_context as _mr_gather_ctx,
+                                    )
+                                    _mr_ctx_brief = _mr_gather_ctx(
+                                        task_text=_mr_original,
+                                        task_type=_mr_dec.type,
+                                        state_dir=_prep.state_dir,
+                                    )
+                                except Exception:
+                                    pass  # context gather is non-fatal
+                                if _mr_ctx_brief:
+                                    user_message = (
+                                        f"{_mr_dec.directive}\n\n"
+                                        f"{_prep.targets_context}\n\n"
+                                        f"[CONTEXT BRIEF]\n{_mr_ctx_brief}\n\n"
+                                        f"{_mr_original}"
+                                    )
+                                else:
+                                    user_message = (
+                                        f"{_mr_dec.directive}\n\n"
+                                        f"{_prep.targets_context}\n\n"
+                                        f"{_mr_original}"
+                                    )
                         except Exception:
                             pass  # Phase 1 failure is non-fatal
             except Exception:
