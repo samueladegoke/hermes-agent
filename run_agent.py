@@ -91,7 +91,11 @@ from agent.model_metadata import (
     save_context_length, is_local_endpoint,
     query_ollama_num_ctx,
 )
-from agent.context_compressor import ContextCompressor
+from agent.context_compressor import (
+    ContextCompressor,
+    DEFAULT_COMPRESSION_THRESHOLD,
+    normalize_compression_threshold,
+)
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
@@ -108,6 +112,21 @@ from agent.trajectory import (
 )
 from utils import atomic_json_write, env_var_enabled
 
+
+
+def _resolve_compression_threshold(compression_cfg) -> float:
+    """Resolve compression.threshold safely.
+
+    Recommended target threshold updated from 50% to 85%. Missing, invalid,
+    or out-of-range values fall back to 0.85 so startup never crashes on bad
+    config input.
+    """
+    if not isinstance(compression_cfg, dict):
+        compression_cfg = {}
+    return normalize_compression_threshold(
+        compression_cfg.get("threshold"),
+        default=DEFAULT_COMPRESSION_THRESHOLD,
+    )
 
 
 class _SafeWriter:
@@ -1142,6 +1161,10 @@ class AIAgent:
             _agent_cfg = _load_agent_config()
         except Exception:
             _agent_cfg = {}
+        _code_harness_cfg = _agent_cfg.get("code_harness", {}) if isinstance(_agent_cfg, dict) else {}
+        if not isinstance(_code_harness_cfg, dict):
+            _code_harness_cfg = {}
+        self._code_harness_cfg = _code_harness_cfg
 
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
@@ -1280,7 +1303,7 @@ class AIAgent:
         _compression_cfg = _agent_cfg.get("compression", {})
         if not isinstance(_compression_cfg, dict):
             _compression_cfg = {}
-        compression_threshold = float(_compression_cfg.get("threshold", 0.50))
+        compression_threshold = _resolve_compression_threshold(_compression_cfg)
         compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in ("true", "1", "yes")
         compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
         compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
@@ -7933,6 +7956,74 @@ class AIAgent:
 
         return final_response
 
+    def _omx_executor_enabled(self) -> bool:
+        env_value = str(os.getenv("HERMES_ENABLE_OMX_EXECUTOR", "")).strip().lower()
+        if env_value:
+            return env_value in {"1", "true", "yes", "on"}
+
+        cfg = getattr(self, "_code_harness_cfg", {})
+        if not isinstance(cfg, dict):
+            return False
+        if not bool(cfg.get("enabled", False)):
+            return False
+        default_engine = str(cfg.get("default", "")).strip().lower()
+        return default_engine == "omx"
+
+    def _omx_command_override(self) -> Optional[str]:
+        env_value = str(os.getenv("HERMES_OMX_COMMAND", "")).strip()
+        if env_value:
+            return env_value
+        cfg = getattr(self, "_code_harness_cfg", {})
+        if not isinstance(cfg, dict):
+            return None
+        omx_cfg = cfg.get("omx", {})
+        if not isinstance(omx_cfg, dict):
+            return None
+        command_value = str(omx_cfg.get("command", "")).strip()
+        return command_value or None
+
+    def _should_handoff_to_omx(self) -> bool:
+        if not self._omx_executor_enabled():
+            return False
+        if getattr(self, "_mr_task_type", None) != "code":
+            return False
+        return bool(
+            getattr(self, "_mr_request_id", None)
+            and getattr(self, "_mr_som_state_dir", None)
+            and getattr(self, "_mr_original_task", None)
+        )
+
+    def _run_omx_handoff(self) -> tuple[str, dict]:
+        from gateway.omx_executor import build_execution_request, execute_request
+
+        state_dir = Path(str(self._mr_som_state_dir))
+        request = build_execution_request(
+            request_id=str(getattr(self, "_mr_request_id", "") or ""),
+            task_type=str(getattr(self, "_mr_task_type", "code") or "code"),
+            mode="execute",
+            directive=str(getattr(self, "_mr_directive", "") or ""),
+            routing_artifact_version=str(getattr(self, "_mr_routing_artifact_version", "static-default") or "static-default"),
+            session_id=getattr(self, "session_id", None),
+            state_dir=state_dir,
+            targets_context=str(getattr(self, "_mr_targets_context", "") or ""),
+            task_text=str(getattr(self, "_mr_original_task", "") or ""),
+            context_brief_path=getattr(self, "_mr_context_brief_path", None),
+        )
+        exec_result = execute_request(
+            request,
+            workdir=os.getenv("TERMINAL_CWD") or os.getcwd(),
+            command_override=self._omx_command_override(),
+        )
+        output_path = Path(str(exec_result.get("output_path") or request["output_path"]))
+        if output_path.exists():
+            response_text = output_path.read_text(encoding="utf-8").strip()
+        else:
+            response_text = ""
+        if not response_text:
+            err = str(exec_result.get("error") or "OMX execution failed without output.")
+            response_text = f"OMX execution failed: {err}"
+        return response_text, exec_result
+
     def run_conversation(
         self,
         user_message: str,
@@ -7994,6 +8085,8 @@ class AIAgent:
         self._mr_original_task = None
         self._mr_routing_artifact_version = None
         self._mr_directive = None
+        self._mr_targets_context = None
+        self._mr_context_brief_path = None
         _mr_platform = getattr(self, "platform", None) or "cli"
         _mr_source = "cli" if _mr_platform == "cli" else "gateway"
         if user_message and not user_message.startswith("[META-ROUTER |"):
@@ -8025,6 +8118,7 @@ class AIAgent:
                             _prep = _mr_p1(_mr_original, _mr_dec.type)
                             if _prep.phase1_ok and _prep.targets_context:
                                 self._mr_som_state_dir = _prep.state_dir
+                                self._mr_targets_context = _prep.targets_context
                                 # Phase 1b: pre-execution context brief
                                 # For research/audit/production tasks, gather relevant
                                 # context BEFORE Hermes runs so it knows where to look
@@ -8042,6 +8136,7 @@ class AIAgent:
                                 except Exception:
                                     pass  # context gather is non-fatal
                                 if _mr_ctx_brief:
+                                    self._mr_context_brief_path = str(Path(_prep.state_dir) / "context_brief.json")
                                     user_message = (
                                         f"{_mr_dec.directive}\n\n"
                                         f"{_prep.targets_context}\n\n"
@@ -8321,6 +8416,19 @@ class AIAgent:
         truncated_response_prefix = ""
         compression_attempts = 0
         _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+
+        # Optional external code-harness shortcut.
+        # When enabled, Hermes still owns routing + Phase 1/2 and simply
+        # delegates the middle execution step to OMX for routed code tasks.
+        if self._should_handoff_to_omx():
+            try:
+                final_response, _omx_exec_result = self._run_omx_handoff()
+                messages.append({"role": "assistant", "content": final_response})
+                _turn_exit_reason = f"omx_executor_{str(_omx_exec_result.get('status') or 'completed')}"
+            except Exception as _omx_exc:
+                final_response = f"OMX execution failed: {_omx_exc}"
+                messages.append({"role": "assistant", "content": final_response})
+                _turn_exit_reason = f"omx_executor_exception({type(_omx_exc).__name__})"
         
         # Record the execution thread so interrupt()/clear_interrupt() can
         # scope the tool-level interrupt signal to THIS agent's thread only.
@@ -8351,7 +8459,7 @@ class AIAgent:
             except Exception:
                 pass
 
-        while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
+        while final_response is None and ((api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call):
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
             self._checkpoint_mgr.new_turn()
 
@@ -11141,6 +11249,8 @@ class AIAgent:
                 self._mr_original_task = None
                 self._mr_routing_artifact_version = None
                 self._mr_directive = None
+                self._mr_targets_context = None
+                self._mr_context_brief_path = None
 
         # Re-persist after MR post-turn processing so session JSON/SQLite reflect
         # the final user-visible answer rather than the pre-evaluation draft.

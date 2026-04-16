@@ -26,6 +26,10 @@ from hermes_cli.nous_subscription import (
 )
 from tools.tool_backend_helpers import managed_nous_tools_enabled
 from hermes_constants import get_optional_skills_dir
+from agent.context_compressor import (
+    DEFAULT_COMPRESSION_THRESHOLD,
+    normalize_compression_threshold,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1405,7 +1409,7 @@ def _apply_default_agent_settings(config: dict):
     config.setdefault("display", {})["tool_progress"] = "all"
 
     config.setdefault("compression", {})["enabled"] = True
-    config["compression"]["threshold"] = 0.50
+    config["compression"]["threshold"] = 0.85
 
     config.setdefault("session_reset", {}).update({
         "mode": "both",
@@ -1417,7 +1421,7 @@ def _apply_default_agent_settings(config: dict):
     print_success("Applied recommended defaults:")
     print_info("  Max iterations: 90")
     print_info("  Tool progress: all")
-    print_info("  Compression threshold: 0.50")
+    print_info("  Compression threshold: 0.85")
     print_info("  Session reset: inactivity (1440 min) + daily (4:00)")
     print_info("  Run `hermes setup agent` later to customize.")
 
@@ -1477,17 +1481,18 @@ def setup_agent_settings(config: dict):
 
     config.setdefault("compression", {})["enabled"] = True
 
-    current_threshold = config.get("compression", {}).get("threshold", 0.50)
-    threshold_str = prompt("Compression threshold (0.5-0.95)", str(current_threshold))
-    try:
-        threshold = float(threshold_str)
-        if 0.5 <= threshold <= 0.95:
-            config["compression"]["threshold"] = threshold
-    except ValueError:
-        pass
+    current_threshold = normalize_compression_threshold(
+        config.get("compression", {}).get("threshold"),
+        default=DEFAULT_COMPRESSION_THRESHOLD,
+    )
+    threshold_str = prompt("Compression threshold (0.50-0.95, recommended 0.85)", str(current_threshold))
+    threshold = normalize_compression_threshold(threshold_str, default=current_threshold)
+    if threshold_str.strip() != str(threshold):
+        print_warning("Invalid threshold input, keeping current safe value")
+    config["compression"]["threshold"] = threshold
 
     print_success(
-        f"Context compression threshold set to {config['compression'].get('threshold', 0.50)}"
+        f"Context compression threshold set to {config['compression'].get('threshold', DEFAULT_COMPRESSION_THRESHOLD)}"
     )
 
     # ── Session Reset Policy ──

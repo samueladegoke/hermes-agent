@@ -345,6 +345,18 @@ DEFAULT_CONFIG = {
         # agent hasn't died during long tasks.  0 = disable notifications.
         "gateway_notify_interval": 600,
     },
+
+    # Optional external code harness selection.
+    # Disabled by default; when enabled and default="omx", routed code tasks
+    # may delegate the middle execution step to oh-my-codex/Codex while Hermes
+    # still owns routing, SoM prepare/complete, and MR-ALS evidence logging.
+    "code_harness": {
+        "enabled": False,
+        "default": "",
+        "omx": {
+            "command": "",
+        },
+    },
     
     "terminal": {
         "backend": "local",
@@ -414,7 +426,7 @@ DEFAULT_CONFIG = {
     
     "compression": {
         "enabled": True,
-        "threshold": 0.50,            # compress when context usage exceeds this ratio
+        "threshold": 0.85,            # compress when context usage exceeds this ratio (recommended target)
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
 
@@ -3088,7 +3100,7 @@ def show_config():
     enabled = compression.get('enabled', True)
     print(f"  Enabled:      {'yes' if enabled else 'no'}")
     if enabled:
-        print(f"  Threshold:    {compression.get('threshold', 0.50) * 100:.0f}%")
+        print(f"  Threshold:    {compression.get('threshold', 0.85) * 100:.0f}%")
         print(f"  Target ratio: {compression.get('target_ratio', 0.20) * 100:.0f}% of threshold preserved")
         print(f"  Protect last: {compression.get('protect_last_n', 20)} messages")
         _aux_comp = config.get('auxiliary', {}).get('compression', {})

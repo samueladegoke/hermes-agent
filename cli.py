@@ -236,7 +236,7 @@ def load_cli_config() -> Dict[str, Any]:
         },
         "compression": {
             "enabled": True,      # Auto-compress when approaching context limit
-            "threshold": 0.50,    # Compress at 50% of model's context limit
+            "threshold": 0.85,    # Compress at 85% of model's context limit
         },
         "smart_model_routing": {
             "enabled": False,

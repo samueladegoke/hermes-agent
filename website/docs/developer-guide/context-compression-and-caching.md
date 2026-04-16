@@ -46,7 +46,7 @@ Hermes has two separate compression layers that operate independently:
                                    │
                                    ▼
                      ┌──────────────────────────┐
-                     │   Agent ContextCompressor │  Fires at 50% of context (default)
+                     │   Agent ContextCompressor │  Fires at 85% of context (default)
                      │   (in-loop, real tokens)  │  Normal context management
                      └──────────────────────────┘
 ```
@@ -57,17 +57,17 @@ Located in `gateway/run.py` (search for `Session hygiene: auto-compress`). This 
 runs before the agent processes a message. It prevents API failures when sessions
 grow too large between turns (e.g., overnight accumulation in Telegram/Discord).
 
-- **Threshold**: Fixed at 85% of model context length
+- **Threshold**: Defaults to 85% of model context length (shared `compression.threshold` setting)
 - **Token source**: Prefers actual API-reported tokens from last turn; falls back
   to rough character-based estimate (`estimate_messages_tokens_rough`)
 - **Fires**: Only when `len(history) >= 4` and compression is enabled
-- **Purpose**: Catch sessions that escaped the agent's own compressor
+- **Purpose**: Catch sessions that escaped the main compressor
 
-The gateway hygiene threshold is intentionally higher than the agent's compressor.
-Setting it at 50% (same as the agent) caused premature compression on every turn
-in long gateway sessions.
+Gateway hygiene now reads the same configured threshold as the agent compressor.
+That keeps CLI and messaging behavior aligned while still providing a pre-agent
+safety net when exact token accounting is unavailable.
 
-### 2. Agent ContextCompressor (50% threshold, configurable)
+### 2. Agent ContextCompressor (85% threshold, configurable)
 
 Located in `agent/context_compressor.py`. This is the **primary compression
 system** that runs inside the agent's tool loop with access to accurate,
@@ -81,7 +81,7 @@ All compression settings are read from `config.yaml` under the `compression` key
 ```yaml
 compression:
   enabled: true              # Enable/disable compression (default: true)
-  threshold: 0.50            # Fraction of context window (default: 0.50 = 50%)
+  threshold: 0.85            # Fraction of context window (default: 0.85 = 85%)
   target_ratio: 0.20         # How much of threshold to keep as tail (default: 0.20)
   protect_last_n: 20         # Minimum protected tail messages (default: 20)
 
@@ -97,7 +97,7 @@ auxiliary:
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
-| `threshold` | `0.50` | 0.0-1.0 | Compression triggers when prompt tokens ≥ `threshold × context_length` |
+| `threshold` | `0.85` | 0.50-0.95 | Compression triggers when prompt tokens ≥ `threshold × context_length` |
 | `target_ratio` | `0.20` | 0.10-0.80 | Controls tail protection token budget: `threshold_tokens × target_ratio` |
 | `protect_last_n` | `20` | ≥1 | Minimum number of recent messages always preserved |
 | `protect_first_n` | `3` | (hardcoded) | System prompt + first exchange always preserved |
@@ -106,8 +106,8 @@ auxiliary:
 
 ```
 context_length       = 200,000
-threshold_tokens     = 200,000 × 0.50 = 100,000
-tail_token_budget    = 100,000 × 0.20 = 20,000
+threshold_tokens     = 200,000 × 0.85 = 170,000
+tail_token_budget    = 170,000 × 0.20 = 34,000
 max_summary_tokens   = min(200,000 × 0.05, 12,000) = 10,000
 ```
 
@@ -346,10 +346,10 @@ The CLI shows caching status at startup:
 ## Context Pressure Warnings
 
 The agent emits context pressure warnings at 85% of the compression threshold
-(not 85% of context — 85% of the threshold which is itself 50% of context):
+(not 85% of context — 85% of the threshold which is itself 85% of context):
 
 ```
-⚠️  Context is 85% to compaction threshold (42,500/50,000 tokens)
+⚠️  Context is 85% to compaction threshold (144,500/170,000 tokens)
 ```
 
 After compression, if usage drops below 85% of threshold, the warning state
