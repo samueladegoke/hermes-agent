@@ -50,7 +50,7 @@ _RULES: list[tuple[Category, list[str]]] = [
     ]),
     ("integration", [
         r"\bapi\b", r"\bwebhook\b", r"\bintegrat", r"\bconnect\b",
-        r"\boauth\b", r"\bauth(?:entication|orization|\.json|\.yaml)\b", r"\btoken\b",
+        r"\boauth\d*\b", r"\bauth(?:entication|orization|\.json|\.yaml)\b", r"\btoken\b",
         r"\bsdk\b", r"\bmcp\b", r"\bplugin\b", r"\bmiddleware\b", r"\bbridge\b",
         r"\binterface\b",
     ]),
