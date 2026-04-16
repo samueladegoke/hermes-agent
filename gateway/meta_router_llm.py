@@ -43,21 +43,36 @@ def _run_with_timeout(fn, timeout_seconds: float):
 
 def _build_system_prompt() -> str:
     return (
-        "You are a task router for an AI coding agent. "
-        "Choose exactly one valid type and one valid mode. "
-        "Respond with valid JSON only."
+        "You are a task router for an AI coding agent.\n"
+        "Choose exactly one type and one mode. Respond with valid JSON only.\n\n"
+        "Type definitions:\n"
+        "  code        — write, fix, refactor, or implement code; scripts; functions; tests\n"
+        "  audit       — security review, vulnerability scan, compliance, pentest\n"
+        "  research    — list, inventory, explain, summarise, investigate, look up, compare;\n"
+        "               also use for discovery tasks like 'what is active', 'list all X'\n"
+        "  production  — deploy, release, rollback, incident response, monitoring, on-call\n"
+        "  integration — API, webhook, OAuth, SDK, middleware, MCP plugin connections\n"
+        "  config      — setup, configuration files, env vars, systemd, nginx, TLS\n"
+        "  design      — UI/UX, frontend layouts, CSS, mockups, Figma, visual components\n"
+        "               (NOT system architecture, database schema, or general planning)\n\n"
+        "Mode definitions:\n"
+        "  execute — do the task directly\n"
+        "  plan    — outline steps or strategy, do not execute yet\n"
+        "  review  — check or verify existing work\n"
+        "  urgent  — time-critical, treat as highest priority"
     )
 
 
 def _build_user_prompt(task: str, keyword_result) -> str:
+    hint = (
+        f"Keyword classifier suggested type={keyword_result.type}, "
+        f"confidence={keyword_result.confidence:.2f}. "
+        "Confidence is low — use your own judgement based on the type definitions."
+    )
     return (
         f"Task:\n{task}\n\n"
-        f"Valid types: {', '.join(_VALID_TYPES)}\n"
-        f"Valid modes: {', '.join(_VALID_MODES)}\n\n"
-        "Keyword hint:\n"
-        f"keyword classifier suggested {keyword_result.type} "
-        f"with confidence {keyword_result.confidence:.2f} — do you agree?\n\n"
-        "Reply with JSON only using this schema:\n"
+        f"Hint: {hint}\n\n"
+        "Reply with JSON only:\n"
         '{"type": "...", "mode": "...", "confidence": 0.0, "reasoning": "one sentence"}'
     )
 

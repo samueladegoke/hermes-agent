@@ -129,10 +129,12 @@ def classify(text: str) -> RouteResult:
     total_hits = sum(scores.values()) or 1
     confidence = round(best_score / total_hits, 3)
 
-    # Fall back to "code" when nothing matched
+    # Fall back to "code" when nothing matched;
+    # confidence=0.0 ensures the LLM fallback is always consulted
+    # for unrecognised tasks (the threshold is < 0.5, not <= 0.5)
     if best_score == 0:
         best_cat = "code"
-        confidence = 0.5
+        confidence = 0.0
 
     # Infer mode
     mode = "execute"
