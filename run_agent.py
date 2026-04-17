@@ -11595,9 +11595,12 @@ class AIAgent:
         except Exception as exc:
             logger.warning("on_session_end hook failed: %s", exc)
 
-        # MR-ALS post-turn: SoM Phase 2 scoring + outcome logging + receipt formatting
+        # MR-ALS post-turn: SoM Phase 2 scoring + outcome logging + receipt formatting.
+        # Reentrancy guard: when a correction pass re-enters run_conversation, the outer
+        # call still owns phase2 evaluation — inner calls must return their draft verbatim.
         _mr_rid = getattr(self, "_mr_request_id", None)
-        if _mr_rid and final_response and final_response.strip():
+        _mr_in_correction = getattr(self, "_mr_in_correction", False)
+        if _mr_rid and final_response and final_response.strip() and not _mr_in_correction:
             try:
                 from gateway.meta_router_executor import (
                     format_routed_response as _mr_fmt,
@@ -11612,6 +11615,8 @@ class AIAgent:
                 _mr_sid = getattr(self, "session_id", None)
                 _mr_directive = getattr(self, "_mr_directive", None) or ""
                 if _mr_sdir and _mr_otask:
+                    # Keep the correction budget small and deterministic.
+                    # The recursion bug came from nested re-entry, not from the cap itself.
                     _MR_MAX_FIX_PASSES = 2
                     _mr_fix_pass = 0
                     _mr_phase2 = _mr_p2(_mr_rid, _mr_tt, _mr_otask, _mr_sdir,
@@ -11661,12 +11666,17 @@ class AIAgent:
                             else:
                                 # Fall back to a fresh agent turn with the correction prompt,
                                 # sharing conversation history so tools remain available.
-                                _fix_result = self.run_conversation(
-                                    user_message=_fix_prefix,
-                                    conversation_history=list(messages),
-                                    persist_user_message="[MR correction pass — not user-visible]",
-                                )
-                                _fix_response = _fix_result.get("final_response", "").strip()
+                                # Set reentrancy flag so the inner call skips its own phase2 block.
+                                self._mr_in_correction = True
+                                try:
+                                    _fix_result = self.run_conversation(
+                                        user_message=_fix_prefix,
+                                        conversation_history=list(messages),
+                                        persist_user_message="[MR correction pass — not user-visible]",
+                                    )
+                                finally:
+                                    self._mr_in_correction = False
+                                _fix_response = (_fix_result.get("final_response") or "").strip()
                             if _fix_response:
                                 final_response = _fix_response
                                 # output.md already exists from the first evaluation.

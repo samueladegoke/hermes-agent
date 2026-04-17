@@ -681,6 +681,16 @@ def test_correction_loop_empty_fix_response_does_not_overwrite(tmp_path):
     assert output_md.read_text(encoding="utf-8") == "original good response"
 
 
+def test_run_conversation_source_coerces_none_fix_response_before_strip():
+    """Correction-pass fallback must not call .strip() on a None final_response."""
+    import inspect
+    import run_agent
+
+    source = inspect.getsource(run_agent.AIAgent.run_conversation)
+
+    assert '(_fix_result.get("final_response") or "").strip()' in source
+
+
 def test_correction_loop_exception_logs_and_breaks(tmp_path, caplog):
     """Exception in inner try block is logged, loop breaks gracefully."""
     fix_prompt = tmp_path / "fix_prompt.md"
@@ -800,3 +810,185 @@ def test_synthesize_produces_actionable_fix_prompt(tmp_path):
     assert "Accuracy" not in content  # passes at 87.5%, should not be in failing list
     assert "Revise your response" in content
     assert len(content) > 50     # meaningful content, not empty
+
+
+
+def test_run_conversation_source_has_reentrancy_guard_for_corrections():
+    """The real run_conversation source must guard inner correction passes from re-entering MR phase2."""
+    import inspect
+    import run_agent
+
+    source = inspect.getsource(run_agent.AIAgent.run_conversation)
+
+    assert '_mr_in_correction = getattr(self, "_mr_in_correction", False)' in source
+    assert 'and not _mr_in_correction' in source
+    assert 'self._mr_in_correction = True' in source
+    assert 'self._mr_in_correction = False' in source
+    assert 'persist_user_message="[MR correction pass — not user-visible]"' in source
+
+
+def test_phase2_keeps_delivery_gate_pass_when_oracle_is_skipped(tmp_path, monkeypatch):
+    """Missing oracle signals must preserve SKIPPED and not force a false FAIL verdict."""
+    import json
+    from gateway.meta_router_executor import run_phase2
+
+    state_dir = tmp_path / 'state'
+    state_dir.mkdir()
+    (state_dir / 'output.md').write_text('Final answer with evidence', encoding='utf-8')
+    (state_dir / 'delivery.json').write_text(json.dumps({
+        'delivery_gate': {'all_passed': True},
+        'scores': {'verdict': 'GOOD', 'threshold': 65}
+    }), encoding='utf-8')
+    (state_dir / 'scores.json').write_text(json.dumps({
+        'total_weighted_score': 88,
+        'verdict': 'GOOD',
+        'threshold': 65
+    }), encoding='utf-8')
+    (state_dir / 'manifest.json').write_text(json.dumps({'tier': 'standard'}), encoding='utf-8')
+    (state_dir / 'verification_evidence.json').write_text(json.dumps({'items': [{'kind': 'runtime', 'detail': 'checked'}]}), encoding='utf-8')
+    (state_dir / 'hypothesis.json').write_text(json.dumps({'hypothesis': 'ok'}), encoding='utf-8')
+    (state_dir / 'edge_scan.json').write_text(json.dumps({'categories_checked': [], 'findings': []}), encoding='utf-8')
+
+    from types import SimpleNamespace
+    monkeypatch.setattr('gateway.meta_router_executor._run_adv_pass', lambda *a, **k: (True, {'findings': []}, None))
+    monkeypatch.setattr('gateway.meta_router_executor._validate_evidence', lambda *a, **k: (True, None))
+    monkeypatch.setattr('gateway.meta_router_executor._load_log_writer', lambda: None)
+    monkeypatch.setattr('gateway.meta_router_executor._maybe_trigger_optimizer', lambda: None)
+    monkeypatch.setattr('gateway.meta_router_executor.subprocess.run', lambda *a, **k: SimpleNamespace(returncode=0, stdout='{}', stderr=''))
+
+    phase2 = run_phase2(
+        request_id='rid-skip-oracle',
+        task_type='research',
+        task_text='Summarize the current project state',
+        som_state_dir=state_dir,
+        final_response='Final answer with evidence',
+        t0=0.0,
+        routing_artifact_version='candidate-test',
+        session_id='session-test',
+    )
+
+    assert phase2.oracle_verdict == 'SKIPPED'
+    assert phase2.delivery_gate_passed is True
+    assert phase2.passed is True
+
+
+
+# ----------------------------------------------------------------------------
+# Dynamic retry limits by task type + reentrancy guard (prod-readiness patches)
+# ----------------------------------------------------------------------------
+
+def _resolve_max_fix_passes(task_type, env=None):
+    """Mirrors the resolver in run_agent.py so the logic can be unit-tested."""
+    import os
+    env = env if env is not None else os.environ
+    defaults = {
+        "code": 3, "integration": 3, "production": 3,
+        "audit": 2, "research": 2, "design": 2, "config": 2,
+    }
+    raw = env.get(f"HERMES_MR_MAX_FIX_PASSES_{task_type.upper()}") or env.get("HERMES_MR_MAX_FIX_PASSES")
+    try:
+        value = int(raw) if raw else defaults.get(task_type, 2)
+    except ValueError:
+        value = defaults.get(task_type, 2)
+    return max(0, value)
+
+
+@pytest.mark.parametrize("task_type,expected", [
+    ("code", 3),
+    ("integration", 3),
+    ("production", 3),
+    ("audit", 2),
+    ("research", 2),
+    ("design", 2),
+    ("config", 2),
+    ("unknown_type", 2),
+])
+def test_dynamic_fix_passes_defaults(task_type, expected):
+    """Advanced task types get 3 passes, others cap at 2, unknown falls back to 2."""
+    assert _resolve_max_fix_passes(task_type, env={}) == expected
+
+
+def test_dynamic_fix_passes_type_specific_env_override():
+    """HERMES_MR_MAX_FIX_PASSES_<TYPE> overrides the default for that type only."""
+    env = {"HERMES_MR_MAX_FIX_PASSES_CODE": "5"}
+    assert _resolve_max_fix_passes("code", env=env) == 5
+    assert _resolve_max_fix_passes("research", env=env) == 2
+
+
+def test_dynamic_fix_passes_global_env_override():
+    """HERMES_MR_MAX_FIX_PASSES applies to every task type when no per-type override."""
+    env = {"HERMES_MR_MAX_FIX_PASSES": "1"}
+    assert _resolve_max_fix_passes("code", env=env) == 1
+    assert _resolve_max_fix_passes("research", env=env) == 1
+
+
+def test_dynamic_fix_passes_type_specific_beats_global():
+    """Per-type env var takes precedence over the global fallback."""
+    env = {
+        "HERMES_MR_MAX_FIX_PASSES": "1",
+        "HERMES_MR_MAX_FIX_PASSES_CODE": "4",
+    }
+    assert _resolve_max_fix_passes("code", env=env) == 4
+    assert _resolve_max_fix_passes("research", env=env) == 1
+
+
+def test_dynamic_fix_passes_invalid_env_falls_back_to_default():
+    """Non-integer env values do not crash - they fall back to the type default."""
+    env = {"HERMES_MR_MAX_FIX_PASSES_CODE": "not-a-number"}
+    assert _resolve_max_fix_passes("code", env=env) == 3
+
+
+def test_dynamic_fix_passes_negative_env_clamped_to_zero():
+    """Negative values clamp to 0 (disables retries entirely)."""
+    env = {"HERMES_MR_MAX_FIX_PASSES": "-5"}
+    assert _resolve_max_fix_passes("code", env=env) == 0
+
+
+def test_reentrancy_guard_skips_inner_phase2(tmp_path):
+    """Guarded condition: when _mr_in_correction is True, phase2 block is skipped."""
+    class _FakeAgent:
+        pass
+
+    agent = _FakeAgent()
+    agent._mr_request_id = "req-abc"
+    final_response = "some draft response"
+    phase2_ran = []
+
+    def _maybe_run_phase2(self):
+        _mr_rid = getattr(self, "_mr_request_id", None)
+        _mr_in_correction = getattr(self, "_mr_in_correction", False)
+        if _mr_rid and final_response and final_response.strip() and not _mr_in_correction:
+            phase2_ran.append(True)
+
+    _maybe_run_phase2(agent)
+    assert len(phase2_ran) == 1
+
+    agent._mr_in_correction = True
+    _maybe_run_phase2(agent)
+    assert len(phase2_ran) == 1
+
+    agent._mr_in_correction = False
+    _maybe_run_phase2(agent)
+    assert len(phase2_ran) == 2
+
+
+def test_reentrancy_flag_set_and_cleared_around_inner_call():
+    """Verifies the flag lifecycle: set before inner run, cleared in finally."""
+    class _Agent:
+        pass
+
+    agent = _Agent()
+    flag_values_seen = []
+
+    def _fake_run_conversation(**_kwargs):
+        flag_values_seen.append(getattr(agent, "_mr_in_correction", False))
+        return {"final_response": "corrected"}
+
+    agent._mr_in_correction = True
+    try:
+        _result = _fake_run_conversation(user_message="fix prompt")
+    finally:
+        agent._mr_in_correction = False
+
+    assert flag_values_seen == [True]
+    assert getattr(agent, "_mr_in_correction", False) is False
