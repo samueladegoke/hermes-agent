@@ -175,6 +175,11 @@ class TestTelegramExecApproval:
 class TestTelegramApprovalCallback:
     """Test the approval callback handling in _handle_callback_query."""
 
+    @pytest.fixture(autouse=True)
+    def _isolate_auth_env(self, monkeypatch):
+        """Ensure TELEGRAM_ALLOWED_USERS does not leak from sibling tests."""
+        monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+
     @pytest.mark.asyncio
     async def test_resolves_approval_on_click(self):
         adapter = _make_adapter()

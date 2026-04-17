@@ -973,11 +973,13 @@ def _do_phase2(
                 or _coerce_score(data.get("scores", {}).get("threshold"))
                 or _coerce_score(delivery_json.get("scores", {}).get("threshold"))
             )
-            oracle_verdict = str(
-                data.get("oracle")
-                or delivery_json.get("oracle")
-                or ("PASS" if data.get("passed") else "FAIL")
-            )
+            _oracle_raw = data.get("oracle") or delivery_json.get("oracle")
+            if _oracle_raw is not None:
+                oracle_verdict = str(_oracle_raw)
+            elif "passed" in data:
+                oracle_verdict = "PASS" if data.get("passed") else "FAIL"
+            # else: preserve the initial "SKIPPED" default — absence of an
+            # oracle signal must NOT be treated as a FAIL verdict.
             delivery_gate = data.get("delivery_gate") or delivery_json.get("delivery_gate") or {}
             if isinstance(delivery_gate, dict):
                 delivery_gate_passed = delivery_gate.get("all_passed")
@@ -1043,7 +1045,9 @@ def _do_phase2(
     outcome_quality = composite_score if composite_score is not None else som_score
 
     passed = bool(delivery_gate_passed) if delivery_gate_passed is not None else False
-    if oracle_verdict != "PASS":
+    # Only an explicit FAIL verdict overrides the delivery_gate signal.
+    # SKIPPED/UNKNOWN (oracle not run) must not force a false-negative fail.
+    if oracle_verdict == "FAIL":
         passed = False
     if adv_pass_clean is False:
         passed = False
