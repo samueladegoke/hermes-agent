@@ -359,6 +359,54 @@ def populate_evidence_artifacts(task_text: str, final_response: str, state_dir: 
         edge_scan_path.write_text(json.dumps(edge_scan, indent=2), encoding="utf-8")
 
 
+_PHASE1_CRITICAL_SIGNALS = {
+    "deploy",
+    "production",
+    "migration",
+    "delete",
+    "security",
+    "auth",
+    "database",
+    "payment",
+    "config",
+    "system",
+    "critical",
+    "breaking",
+    "irreversible",
+    "encrypt",
+    "api key",
+    "secret",
+    "rotate secrets",
+}
+
+
+
+def resolve_phase1_tier(task_text: str, mr_type: str) -> str:
+    """Choose a safer SoM tier for pre-execution target generation.
+
+    The old behavior hardcoded `trivial` for every routed task, which lowered
+    thresholds and skipped SoM context gathering even for substantial code work.
+    Keep Phase 1 lightweight, but avoid under-tiering by default:
+    - production/config work is critical
+    - any task with critical-risk keywords is critical
+    - routed code/integration/audit/research/design work is standard
+    - only short, low-risk general tasks fall back to trivial
+    """
+    task_lower = (task_text or "").lower()
+    text_len = len((task_text or "").strip())
+
+    if mr_type in {"production", "config"}:
+        return "critical"
+    if any(signal in task_lower for signal in _PHASE1_CRITICAL_SIGNALS):
+        return "critical"
+    if mr_type in {"code", "integration", "audit", "research", "design"}:
+        return "standard"
+    if text_len < 80:
+        return "trivial"
+    return "standard"
+
+
+
 def resolve_phase2_tier(state_dir: Path) -> str:
     state_dir = Path(state_dir)
     manifest = _load_json_file(state_dir / "manifest.json")
@@ -495,6 +543,54 @@ def _validate_evidence(state_dir: Path) -> tuple[Optional[bool], str]:
     except Exception:
         return None, ""
 
+
+
+def _synthesize_fix_prompt(state_dir: Path, task_text: str, score: Optional[float], threshold: Optional[float]) -> Optional[Path]:
+    """Generate a minimal fix_prompt.md from scores.json when SoM did not create one.
+
+    Used for trivial-tier tasks (max_iterations=1) that fail the score gate without
+    ever producing a fix_prompt -- the correction loop in run_agent.py needs this file.
+    """
+    scores_path = state_dir / "scores.json"
+    fix_prompt_path = state_dir / "fix_prompt.md"
+    if fix_prompt_path.exists():
+        return fix_prompt_path  # Already exists -- do not overwrite
+
+    try:
+        scores_data = _load_json_file(scores_path)
+        if not scores_data:
+            return None
+
+        dimensions = scores_data.get("dimensions", [])
+        if not dimensions:
+            return None
+
+        effective_threshold = threshold or 65
+        failing = [
+            d for d in dimensions
+            if d.get("max_possible", 0) > 0
+            and (d.get("weighted", 0) / d.get("max_possible", 1)) < 0.6
+        ]
+        if not failing:
+            failing = sorted(dimensions, key=lambda d: d.get("weighted", 0) / max(d.get("max_possible", 1), 1))[:2]
+
+        lines = [
+            "Score {:.0f}/{:.0f} - the following areas need improvement:".format(score, effective_threshold),
+        ]
+        for d in failing:
+            name = d.get("name", "Unknown")
+            got = d.get("weighted", 0)
+            possible = d.get("max_possible", 0)
+            reasoning = d.get("reasoning", "")
+            lines.append("- **{}** ({:.0f}/{:.0f}): {}".format(name, got, possible, reasoning))
+
+        lines.append("")
+        lines.append("Revise your response to address these gaps, citing live evidence where relevant.")
+        fix_content = "\n".join(lines)
+        fix_prompt_path.write_text(fix_content, encoding="utf-8")
+        return fix_prompt_path
+    except Exception:
+        return None
 
 
 def _enhance_fix_prompt(path: Path, task_text: str, task_type: str, score: Optional[float], threshold: Optional[float]) -> None:
@@ -661,6 +757,7 @@ def run_phase1(task_text: str, mr_type: str) -> PrepResult:
         return PrepResult(None, "", error=f"som_pipeline.py not found at {_SOM_PIPELINE}")
 
     som_type = _MR_TO_SOM_TYPE.get(mr_type, "code")
+    phase1_tier = resolve_phase1_tier(task_text, mr_type)
     try:
         result = subprocess.run(
             [
@@ -671,7 +768,7 @@ def run_phase1(task_text: str, mr_type: str) -> PrepResult:
                 "--task-type",
                 som_type,
                 "--tier",
-                "trivial",
+                phase1_tier,
             ],
             capture_output=True,
             text=True,
@@ -778,6 +875,12 @@ def _do_phase2(
     ref_entry: Optional[dict] = None
     delivery_path: Optional[str] = None
     fix_prompt_path: Optional[str] = None
+    executor_engine: Optional[str] = None
+    omx_workflow: Optional[str] = None
+    launch_mode: Optional[str] = None
+    omx_version: Optional[str] = None
+    codex_version: Optional[str] = None
+    team_size: Optional[int] = None
     verdict = "UNKNOWN"
     threshold: Optional[float] = None
     error: Optional[str] = None
@@ -832,6 +935,26 @@ def _do_phase2(
 
             scores_json = _load_json_file(scores_path)
             delivery_json = _load_json_file(delivery_json_path)
+            execution_result_json = _load_json_file(som_state_dir / "execution_result.json")
+
+            executor_engine = str(
+                execution_result_json.get("executor_engine")
+                or execution_result_json.get("engine")
+                or ""
+            ).strip() or None
+            omx_workflow = str(
+                execution_result_json.get("omx_workflow")
+                or execution_result_json.get("workflow")
+                or ""
+            ).strip() or None
+            launch_mode = str(execution_result_json.get("launch_mode") or "").strip() or None
+            omx_version = str(execution_result_json.get("omx_version") or "").strip() or None
+            codex_version = str(execution_result_json.get("codex_version") or "").strip() or None
+            _team_size_raw = execution_result_json.get("team_size")
+            try:
+                team_size = int(_team_size_raw) if _team_size_raw is not None else None
+            except (TypeError, ValueError):
+                team_size = None
 
             som_score = (
                 _coerce_score(data.get("score"))
@@ -862,11 +985,29 @@ def _do_phase2(
             ref_entry = data.get("ref_entry") or delivery_json.get("ref_entry")
             delivery_path = data.get("delivery_path") or (str(delivery_json_path) if delivery_json_path.exists() else None)
             fix_prompt_path = str(fix_prompt) if fix_prompt.exists() else None
+            # If SoM did not generate fix_prompt (trivial-tier, max_iterations=1),
+            # synthesize one from scores so the run_agent.py correction loop can fire.
+            if not fix_prompt_path and som_score is not None and som_score < (threshold or 65):
+                _synth = _synthesize_fix_prompt(som_state_dir, task_text, som_score, threshold)
+                if _synth:
+                    fix_prompt_path = str(_synth)
             if fix_prompt_path and som_score is not None and som_score < (threshold or 65):
                 _enhance_fix_prompt(Path(fix_prompt_path), task_text, task_type, som_score, threshold)
             notes.append(f"artifact={routing_artifact_version}")
             if session_id:
                 notes.append(f"session={session_id}")
+            if executor_engine:
+                notes.append(f"executor_engine={executor_engine}")
+            if omx_workflow:
+                notes.append(f"omx_workflow={omx_workflow}")
+            if launch_mode:
+                notes.append(f"launch_mode={launch_mode}")
+            if omx_version:
+                notes.append(f"omx_version={omx_version}")
+            if codex_version:
+                notes.append(f"codex_version={codex_version}")
+            if team_size is not None:
+                notes.append(f"team_size={team_size}")
 
             evidence_valid, evidence_preview = _validate_evidence(som_state_dir)
             if evidence_valid is not None:
@@ -951,6 +1092,12 @@ def _do_phase2(
                 verdict=verdict,
                 threshold=threshold,
                 latency_ms=latency_ms,
+                executor_engine=executor_engine,
+                omx_workflow=omx_workflow,
+                launch_mode=launch_mode,
+                omx_version=omx_version,
+                codex_version=codex_version,
+                team_size=team_size,
                 error=error,
                 notes=" | ".join(notes) if notes else None,
             )

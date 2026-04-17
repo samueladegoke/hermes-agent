@@ -8226,10 +8226,18 @@ class AIAgent:
             and getattr(self, "_mr_original_task", None)
         )
 
-    def _run_omx_handoff(self) -> tuple[str, dict]:
+    def _run_omx_handoff(self, correction_task_text: Optional[str] = None) -> tuple[Optional[str], dict]:
         from gateway.omx_executor import build_execution_request, execute_request
 
         state_dir = Path(str(self._mr_som_state_dir))
+        base_task_text = str(getattr(self, "_mr_original_task", "") or "")
+        if correction_task_text:
+            task_text = (
+                f"Original task:\n{base_task_text}\n\n"
+                f"Correction instructions:\n{correction_task_text}"
+            ).strip()
+        else:
+            task_text = base_task_text
         request = build_execution_request(
             request_id=str(getattr(self, "_mr_request_id", "") or ""),
             task_type=str(getattr(self, "_mr_task_type", "code") or "code"),
@@ -8239,7 +8247,7 @@ class AIAgent:
             session_id=getattr(self, "session_id", None),
             state_dir=state_dir,
             targets_context=str(getattr(self, "_mr_targets_context", "") or ""),
-            task_text=str(getattr(self, "_mr_original_task", "") or ""),
+            task_text=task_text,
             context_brief_path=getattr(self, "_mr_context_brief_path", None),
         )
         exec_result = execute_request(
@@ -8253,8 +8261,7 @@ class AIAgent:
         else:
             response_text = ""
         if not response_text:
-            err = str(exec_result.get("error") or "OMX execution failed without output.")
-            response_text = f"OMX execution failed: {err}"
+            return None, exec_result
         return response_text, exec_result
 
     def run_conversation(
@@ -8665,13 +8672,26 @@ class AIAgent:
         # delegates the middle execution step to OMX for routed code tasks.
         if self._should_handoff_to_omx():
             try:
-                final_response, _omx_exec_result = self._run_omx_handoff()
-                messages.append({"role": "assistant", "content": final_response})
-                _turn_exit_reason = f"omx_executor_{str(_omx_exec_result.get('status') or 'completed')}"
+                _omx_response, _omx_exec_result = self._run_omx_handoff()
+                if _omx_response:
+                    final_response = _omx_response
+                    messages.append({"role": "assistant", "content": final_response})
+                    _turn_exit_reason = f"omx_executor_{str(_omx_exec_result.get('status') or 'completed')}"
+                else:
+                    _turn_exit_reason = f"omx_executor_{str(_omx_exec_result.get('status') or 'failed')}_fallback"
+                    logging.warning(
+                        "OMX handoff produced no output artifacts for request %s; falling back to native execution. Result=%s",
+                        getattr(self, "_mr_request_id", None),
+                        _omx_exec_result,
+                    )
             except Exception as _omx_exc:
-                final_response = f"OMX execution failed: {_omx_exc}"
-                messages.append({"role": "assistant", "content": final_response})
-                _turn_exit_reason = f"omx_executor_exception({type(_omx_exc).__name__})"
+                _turn_exit_reason = f"omx_executor_exception({type(_omx_exc).__name__})_fallback"
+                logging.warning(
+                    "OMX handoff raised %s for request %s; falling back to native execution.",
+                    type(_omx_exc).__name__,
+                    getattr(self, "_mr_request_id", None),
+                    exc_info=True,
+                )
         
         # Record the execution thread so interrupt()/clear_interrupt() can
         # scope the tool-level interrupt signal to THIS agent's thread only.
@@ -11525,20 +11545,37 @@ class AIAgent:
                                 if _mr_phase2.threshold is not None else "?"
                             )
                             _fix_prefix = (
-                                f"[META-ROUTER | CORRECTION PASS {_mr_fix_pass}/{_MR_MAX_FIX_PASSES}]\n"
-                                f"Score: {_score_str}/{_thresh_str} — "
-                                f"revision needed before delivery.\n\n"
+                                f"CORRECTION PASS {_mr_fix_pass}/{_MR_MAX_FIX_PASSES} — "
+                                f"Score was {_score_str}/{_thresh_str}, revision needed before delivery.\n\n"
                                 f"{_fix_instructions}\n\n"
                                 f"Revise and restate your complete response below."
                             )
-                            # Run a fresh agent turn with the correction prompt,
-                            # sharing conversation history so tools remain available.
-                            _fix_result = self.run_conversation(
-                                user_message=_fix_prefix,
-                                conversation_history=list(messages),
-                                persist_user_message="[MR correction pass — not user-visible]",
+                            # Run a fresh correction pass. For routed code work with
+                            # the OMX harness enabled, re-enter OMX directly so the
+                            # external executor owns the revision loop too.
+                            _fix_response = ""
+                            _use_omx_correction = (
+                                _mr_tt == "code"
+                                and self._omx_executor_enabled()
+                                and getattr(self, "_mr_som_state_dir", None)
                             )
-                            _fix_response = _fix_result.get("final_response", "").strip()
+                            if _use_omx_correction:
+                                _fix_response, _fix_exec_result = self._run_omx_handoff(
+                                    correction_task_text=_fix_prefix,
+                                )
+                                if not _fix_response:
+                                    raise RuntimeError(
+                                        f"OMX correction pass produced no output: {_fix_exec_result}"
+                                    )
+                            else:
+                                # Fall back to a fresh agent turn with the correction prompt,
+                                # sharing conversation history so tools remain available.
+                                _fix_result = self.run_conversation(
+                                    user_message=_fix_prefix,
+                                    conversation_history=list(messages),
+                                    persist_user_message="[MR correction pass — not user-visible]",
+                                )
+                                _fix_response = _fix_result.get("final_response", "").strip()
                             if _fix_response:
                                 final_response = _fix_response
                                 # output.md already exists from the first evaluation.
@@ -11556,7 +11593,11 @@ class AIAgent:
                                     _mr_rid, _mr_tt, _mr_otask, _mr_sdir,
                                     final_response, _mr_t0, _mr_art, _mr_sid,
                                 )
-                        except Exception:
+                        except Exception as _mr_fix_exc:
+                            import logging as _mr_logging
+                            _mr_logging.getLogger("meta_router").warning(
+                                "MR correction pass %d failed: %s", _mr_fix_pass, _mr_fix_exc
+                            )
                             break  # non-fatal — proceed with last result
                     final_response = _mr_fmt(final_response, _mr_phase2, directive=_mr_directive)
                     result["final_response"] = final_response
@@ -11566,8 +11607,11 @@ class AIAgent:
                             break
                 else:
                     _mr_out_only(_mr_rid, _mr_tt, _mr_t0, _mr_art, _mr_sid)
-            except Exception:
-                pass
+            except Exception as _mr_p2_exc:
+                import logging as _mr_logging
+                _mr_logging.getLogger("meta_router").warning(
+                    "MR phase2 block failed: %s", _mr_p2_exc
+                )
             finally:
                 self._mr_request_id = None
                 self._mr_som_state_dir = None
