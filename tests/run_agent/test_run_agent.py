@@ -238,6 +238,63 @@ def _mock_response(
     return resp
 
 
+class TestBackgroundReviewHelpers:
+    def test_build_background_review_prompt_returns_none_without_flags(self):
+        assert AIAgent._build_background_review_prompt(False, False) is None
+
+    def test_skill_review_prompt_documents_reusable_skill_rule(self):
+        prompt = AIAgent._build_background_review_prompt(False, True)
+        assert prompt is not None
+        assert "Only save or update a skill" in prompt
+        assert "empty, ambiguous, one-off" in prompt
+        assert "Nothing to save." in prompt
+
+    def test_collect_background_review_actions_ignores_empty_and_invalid_payloads(self):
+        actions = AIAgent._collect_background_review_actions(
+            [
+                {"role": "assistant", "content": "Nothing to save."},
+                {"role": "tool", "content": ""},
+                {"role": "tool", "content": "not-json"},
+                {"role": "tool", "content": "[]"},
+                {
+                    "role": "tool",
+                    "content": json.dumps({"success": False, "message": "Skill failed"}),
+                },
+                {
+                    "role": "tool",
+                    "content": json.dumps(
+                        {"success": True, "message": "Skill 'reuse' created."}
+                    ),
+                },
+                {
+                    "role": "tool",
+                    "content": json.dumps(
+                        {"success": True, "message": "Entry added", "target": "memory"}
+                    ),
+                },
+            ]
+        )
+
+        assert actions == ["Skill 'reuse' created.", "Memory updated"]
+
+    def test_spawn_background_review_returns_early_for_empty_history(self, agent):
+        with patch("threading.Thread") as mock_thread:
+            agent._spawn_background_review([], review_skills=True)
+        mock_thread.assert_not_called()
+
+    def test_spawn_background_review_returns_early_when_no_review_requested(
+        self,
+        agent,
+    ):
+        with patch("threading.Thread") as mock_thread:
+            agent._spawn_background_review(
+                [{"role": "user", "content": "hello"}],
+                review_memory=False,
+                review_skills=False,
+            )
+        mock_thread.assert_not_called()
+
+
 # ===================================================================
 # Group 1: Pure Functions
 # ===================================================================

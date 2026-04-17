@@ -37,11 +37,19 @@ import time
 import threading
 from types import SimpleNamespace
 import uuid
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional, Sequence, TypedDict
 from openai import OpenAI
 import fire
 from datetime import datetime
 from pathlib import Path
+
+
+class _BackgroundReviewToolPayload(TypedDict, total=False):
+    """Normalized subset of tool payload fields used by background review."""
+
+    success: bool
+    message: str
+    target: str
 
 from hermes_constants import get_hermes_home
 
@@ -2357,11 +2365,19 @@ class AIAgent:
         "If nothing is worth saving, just say 'Nothing to save.' and stop."
     )
 
+    _SKILL_REVIEW_DECISION_RULE = (
+        "Only save or update a skill when the chat clearly shows a reusable non-trivial "
+        "approach, a trial-and-error pivot, or a user-preferred method/outcome that "
+        "should change future behavior. If the conversation is empty, ambiguous, one-off, "
+        "or shows no reusable pattern, reply exactly 'Nothing to save.' and stop."
+    )
+
     _SKILL_REVIEW_PROMPT = (
         "Review the conversation above and consider saving or updating a skill if appropriate.\n\n"
         "Focus on: was a non-trivial approach used to complete a task that required trial "
         "and error, or changing course due to experiential findings along the way, or did "
         "the user expect or desire a different method or outcome?\n\n"
+        f"{_SKILL_REVIEW_DECISION_RULE}\n\n"
         "If a relevant skill already exists, update it with what you learned. "
         "Otherwise, create a new skill if the approach is reusable.\n"
         "If nothing is worth saving, just say 'Nothing to save.' and stop."
@@ -2375,11 +2391,102 @@ class AIAgent:
         "If so, save using the memory tool.\n\n"
         "**Skills**: Was a non-trivial approach used to complete a task that required trial "
         "and error, or changing course due to experiential findings along the way, or did "
-        "the user expect or desire a different method or outcome? If a relevant skill "
-        "already exists, update it. Otherwise, create a new one if the approach is reusable.\n\n"
+        "the user expect or desire a different method or outcome? "
+        f"{_SKILL_REVIEW_DECISION_RULE} "
+        "If a relevant skill already exists, update it. Otherwise, create a new one if "
+        "the approach is reusable.\n\n"
         "Only act if there's something genuinely worth saving. "
         "If nothing stands out, just say 'Nothing to save.' and stop."
     )
+
+    @staticmethod
+    def _build_background_review_prompt(
+        review_memory: bool,
+        review_skills: bool,
+    ) -> Optional[str]:
+        """Return the review prompt for the requested background review mode."""
+        if review_memory and review_skills:
+            return AIAgent._COMBINED_REVIEW_PROMPT
+        if review_memory:
+            return AIAgent._MEMORY_REVIEW_PROMPT
+        if review_skills:
+            return AIAgent._SKILL_REVIEW_PROMPT
+        return None
+
+    @staticmethod
+    def _parse_background_review_tool_payload(
+        raw_content: Any,
+    ) -> Optional[_BackgroundReviewToolPayload]:
+        """Safely parse a background-review tool payload.
+
+        Empty strings, malformed JSON, list payloads, or unrelated text return None.
+        """
+        if raw_content is None:
+            return None
+
+        parsed: Any
+        if isinstance(raw_content, dict):
+            parsed = raw_content
+        elif isinstance(raw_content, str):
+            stripped = raw_content.strip()
+            if not stripped:
+                return None
+            try:
+                parsed = json.loads(stripped)
+            except (json.JSONDecodeError, TypeError):
+                return None
+        else:
+            return None
+
+        if not isinstance(parsed, dict):
+            return None
+
+        payload: _BackgroundReviewToolPayload = {
+            "success": bool(parsed.get("success")),
+            "message": str(parsed.get("message") or ""),
+            "target": str(parsed.get("target") or ""),
+        }
+        return payload
+
+    @staticmethod
+    def _label_background_review_target(target: Optional[str]) -> str:
+        """Map internal background-review targets to user-facing labels."""
+        normalized = (target or "").strip().lower()
+        if normalized == "memory":
+            return "Memory"
+        if normalized == "user":
+            return "User profile"
+        if not normalized:
+            return "Background review"
+        return normalized.replace("_", " ").title()
+
+    @classmethod
+    def _collect_background_review_actions(
+        cls,
+        messages: Optional[Sequence[Dict[str, Any]]],
+    ) -> List[str]:
+        """Extract compact user-facing action summaries from tool messages."""
+        actions: List[str] = []
+        for msg in messages or []:
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+
+            payload = cls._parse_background_review_tool_payload(msg.get("content"))
+            if not payload or not payload.get("success"):
+                continue
+
+            message = payload.get("message", "")
+            message_lower = message.lower()
+            target_label = cls._label_background_review_target(payload.get("target"))
+
+            if "created" in message_lower or "updated" in message_lower:
+                actions.append(message)
+            elif "added" in message_lower or "entry added" in message_lower:
+                actions.append(f"{target_label} updated")
+            elif "removed" in message_lower or "replaced" in message_lower:
+                actions.append(f"{target_label} updated")
+
+        return actions
 
     def _spawn_background_review(
         self,
@@ -2396,13 +2503,16 @@ class AIAgent:
         """
         import threading
 
-        # Pick the right prompt based on which triggers fired
-        if review_memory and review_skills:
-            prompt = self._COMBINED_REVIEW_PROMPT
-        elif review_memory:
-            prompt = self._MEMORY_REVIEW_PROMPT
-        else:
-            prompt = self._SKILL_REVIEW_PROMPT
+        history = list(messages_snapshot or [])
+        if len(history) == 0:
+            return
+
+        prompt = self._build_background_review_prompt(
+            review_memory=review_memory,
+            review_skills=review_skills,
+        )
+        if prompt is None:
+            return
 
         def _run_review():
             import contextlib, os as _os
@@ -2426,36 +2536,14 @@ class AIAgent:
 
                     review_agent.run_conversation(
                         user_message=prompt,
-                        conversation_history=messages_snapshot,
+                        conversation_history=history,
                     )
 
                 # Scan the review agent's messages for successful tool actions
                 # and surface a compact summary to the user.
-                actions = []
-                for msg in getattr(review_agent, "_session_messages", []):
-                    if not isinstance(msg, dict) or msg.get("role") != "tool":
-                        continue
-                    try:
-                        data = json.loads(msg.get("content", "{}"))
-                    except (json.JSONDecodeError, TypeError):
-                        continue
-                    if not data.get("success"):
-                        continue
-                    message = data.get("message", "")
-                    target = data.get("target", "")
-                    if "created" in message.lower():
-                        actions.append(message)
-                    elif "updated" in message.lower():
-                        actions.append(message)
-                    elif "added" in message.lower() or (target and "add" in message.lower()):
-                        label = "Memory" if target == "memory" else "User profile" if target == "user" else target
-                        actions.append(f"{label} updated")
-                    elif "Entry added" in message:
-                        label = "Memory" if target == "memory" else "User profile" if target == "user" else target
-                        actions.append(f"{label} updated")
-                    elif "removed" in message.lower() or "replaced" in message.lower():
-                        label = "Memory" if target == "memory" else "User profile" if target == "user" else target
-                        actions.append(f"{label} updated")
+                actions = self._collect_background_review_actions(
+                    getattr(review_agent, "_session_messages", None)
+                )
 
                 if actions:
                     summary = " · ".join(dict.fromkeys(actions))
