@@ -75,7 +75,9 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
             return await self._primary.handle_async_request(request)
 
         sticky_ip = self._sticky_ip
-        attempt_order: list[Optional[str]] = [sticky_ip] if sticky_ip else [None]
+        attempt_order: list[Optional[str]] = [sticky_ip] if sticky_ip else []
+        if None not in attempt_order:
+            attempt_order.append(None)
         for ip in self._fallback_ips:
             if ip != sticky_ip:
                 attempt_order.append(ip)
@@ -86,6 +88,14 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
             transport = self._primary if ip is None else self._fallbacks[ip]
             try:
                 response = await transport.handle_async_request(candidate)
+                if ip is None and sticky_ip is not None:
+                    async with self._sticky_lock:
+                        if self._sticky_ip == sticky_ip:
+                            self._sticky_ip = None
+                            logger.info(
+                                "[Telegram] Primary api.telegram.org path recovered; clearing sticky fallback IP %s",
+                                sticky_ip,
+                            )
                 if ip is not None and self._sticky_ip != ip:
                     async with self._sticky_lock:
                         if self._sticky_ip != ip:
