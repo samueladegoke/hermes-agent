@@ -177,6 +177,7 @@ AUTHOR_MAP = {
     "hermes@noushq.ai": "benbarclay",
     "chinmingcock@gmail.com": "ChimingLiu",
     "openclaw@sparklab.ai": "openclaw",
+    "samade10@debian": "samueladegoke",
     "semihcvlk53@gmail.com": "Himess",
     "erenkar950@gmail.com": "erenkarakus",
     "adavyasharma@gmail.com": "adavyas",
