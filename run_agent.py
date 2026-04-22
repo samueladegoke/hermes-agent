@@ -78,6 +78,60 @@ from tools.browser_tool import cleanup_browser
 
 from hermes_constants import OPENROUTER_BASE_URL
 
+_META_ROUTER_DIRECTIVE_RE = re.compile(r"^\[META-ROUTER\s*\|\s*([^|\]]+)\s*\|\s*([^\]]+)\]")
+
+# Review-mode turns should stay read-only. Keep the tool surface narrow and
+# investigative so routed code reviews cannot silently mutate files, processes,
+# external services, or memory/state.
+_REVIEW_SAFE_TOOL_NAMES = frozenset({
+    "read_file",
+    "search_files",
+    "session_search",
+    "skills_list",
+    "skill_view",
+    "web_search",
+    "web_extract",
+    "vision_analyze",
+    "browser_navigate",
+    "browser_snapshot",
+    "browser_get_images",
+    "browser_scroll",
+    "browser_back",
+    "browser_vision",
+    "memory_search",
+    "memory_get",
+    "qmd__query",
+    "qmd__get",
+    "supermemory_search",
+    "open-brain__recall",
+})
+
+
+def _parse_meta_router_directive(text: str | None) -> tuple[str | None, str | None, str | None]:
+    if not isinstance(text, str) or not text:
+        return None, None, None
+    first_line = text.splitlines()[0].strip()
+    match = _META_ROUTER_DIRECTIVE_RE.match(first_line)
+    if not match:
+        return None, None, None
+    task_type = match.group(1).strip().lower() or None
+    mode = match.group(2).strip().lower() or None
+    return first_line, task_type, mode
+
+
+def _preferred_session_cwd(platform: str | None) -> str:
+    platform_name = str(platform or "cli").strip().lower() or "cli"
+    messaging_cwd = (os.getenv("MESSAGING_CWD") or "").strip()
+    terminal_cwd = (os.getenv("TERMINAL_CWD") or "").strip()
+    if platform_name != "cli" and messaging_cwd:
+        return messaging_cwd
+    if terminal_cwd:
+        return terminal_cwd
+    if messaging_cwd:
+        return messaging_cwd
+    return os.getcwd()
+
+
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import build_memory_context_block, sanitize_context
 from agent.retry_utils import jittered_backoff
@@ -1528,6 +1582,14 @@ class AIAgent:
             _agent_section = {}
         self._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
+        # Dedicated coding-harness routing config. This powers the Hermes →
+        # OMX/Codex handoff for routed code tasks. The helper methods further
+        # down (`_omx_executor_enabled()` / `_omx_command_override()`) read from
+        # `self._code_harness_cfg`, so keep the loaded config on the instance
+        # instead of requiring an env-var-only rollout.
+        _code_harness_cfg = _agent_cfg.get("code_harness", {})
+        self._code_harness_cfg = _code_harness_cfg if isinstance(_code_harness_cfg, dict) else {}
+
         # Initialize context compressor for automatic context management
         # Compresses conversation when approaching model's context limit
         # Configuration via config.yaml (compression section)
@@ -1721,6 +1783,12 @@ class AIAgent:
                     self.valid_tool_names.add(_tname)
                     self._context_engine_tool_names.add(_tname)
 
+        # Keep the full discovered tool surface so turn-scoped routing policies
+        # (for example review-mode read-only filtering) can narrow tools during a
+        # single turn without permanently mutating cached gateway agents.
+        self._base_tools = list(self.tools or [])
+        self._base_valid_tool_names = set(self.valid_tool_names or set())
+
         # Notify context engine of session start
         if hasattr(self, "context_compressor") and self.context_compressor:
             try:
@@ -1735,7 +1803,7 @@ class AIAgent:
                 logger.debug("Context engine on_session_start: %s", _ce_err)
 
         self._subdirectory_hints = SubdirectoryHintTracker(
-            working_dir=os.getenv("TERMINAL_CWD") or None,
+            working_dir=_preferred_session_cwd(self.platform),
         )
         self._user_turn_count = 0
 
@@ -4076,11 +4144,10 @@ class AIAgent:
             prompt_parts.append(skills_prompt)
 
         if not self.skip_context_files:
-            # Use TERMINAL_CWD for context file discovery when set (gateway
-            # mode).  The gateway process runs from the hermes-agent install
-            # dir, so os.getcwd() would pick up the repo's AGENTS.md and
-            # other dev files — inflating token usage by ~10k for no benefit.
-            _context_cwd = os.getenv("TERMINAL_CWD") or None
+            # Prefer the user-facing messaging cwd for gateway sessions so
+            # context file discovery reflects the actual chat/workspace target
+            # rather than the long-lived hermes-agent service repo checkout.
+            _context_cwd = _preferred_session_cwd(self.platform)
             context_files_prompt = build_context_files_prompt(
                 cwd=_context_cwd, skip_soul=_soul_loaded)
             if context_files_prompt:
@@ -7794,7 +7861,7 @@ class AIAgent:
                 try:
                     cmd = function_args.get("command", "")
                     if _is_destructive_command(cmd):
-                        cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
+                        cwd = function_args.get("workdir") or _preferred_session_cwd(self.platform)
                         self._checkpoint_mgr.ensure_checkpoint(
                             cwd, f"before terminal: {cmd[:60]}"
                         )
@@ -8148,7 +8215,7 @@ class AIAgent:
                 try:
                     cmd = function_args.get("command", "")
                     if _is_destructive_command(cmd):
-                        cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
+                        cwd = function_args.get("workdir") or _preferred_session_cwd(self.platform)
                         self._checkpoint_mgr.ensure_checkpoint(
                             cwd, f"before terminal: {cmd[:60]}"
                         )
@@ -8604,6 +8671,24 @@ class AIAgent:
 
         return final_response
 
+    def _reset_turn_tools(self) -> None:
+        self.tools = list(getattr(self, "_base_tools", []) or [])
+        self.valid_tool_names = set(getattr(self, "_base_valid_tool_names", set()) or set())
+
+    def _apply_turn_tool_policy(self) -> None:
+        self._reset_turn_tools()
+        if str(getattr(self, "_mr_mode", "") or "").strip().lower() != "review":
+            return
+        filtered_tools = []
+        filtered_names = set()
+        for tool in self.tools or []:
+            name = tool.get("function", {}).get("name") if isinstance(tool, dict) else None
+            if name in _REVIEW_SAFE_TOOL_NAMES:
+                filtered_tools.append(tool)
+                filtered_names.add(name)
+        self.tools = filtered_tools
+        self.valid_tool_names = filtered_names
+
     def _omx_executor_enabled(self) -> bool:
         env_value = str(os.getenv("HERMES_ENABLE_OMX_EXECUTOR", "")).strip().lower()
         if env_value:
@@ -8635,6 +8720,8 @@ class AIAgent:
             return False
         if getattr(self, "_mr_task_type", None) != "code":
             return False
+        if str(getattr(self, "_mr_mode", "") or "").strip().lower() != "execute":
+            return False
         return bool(
             getattr(self, "_mr_request_id", None)
             and getattr(self, "_mr_som_state_dir", None)
@@ -8656,7 +8743,7 @@ class AIAgent:
         request = build_execution_request(
             request_id=str(getattr(self, "_mr_request_id", "") or ""),
             task_type=str(getattr(self, "_mr_task_type", "code") or "code"),
-            mode="execute",
+            mode=str(getattr(self, "_mr_mode", "execute") or "execute"),
             directive=str(getattr(self, "_mr_directive", "") or ""),
             routing_artifact_version=str(getattr(self, "_mr_routing_artifact_version", "static-default") or "static-default"),
             session_id=getattr(self, "session_id", None),
@@ -8665,11 +8752,12 @@ class AIAgent:
             task_text=task_text,
             context_brief_path=getattr(self, "_mr_context_brief_path", None),
         )
+        _mr_platform = getattr(self, "platform", None) or "cli"
         handoff_workdir = (
-            os.getenv("TERMINAL_CWD")
-            or os.getenv("MESSAGING_CWD")
-            or os.getcwd()
-        )
+            (os.getenv("MESSAGING_CWD") or os.getenv("TERMINAL_CWD"))
+            if _mr_platform != "cli"
+            else (os.getenv("TERMINAL_CWD") or os.getenv("MESSAGING_CWD"))
+        ) or os.getcwd()
         exec_result = execute_request(
             request,
             workdir=handoff_workdir,
@@ -8751,6 +8839,7 @@ class AIAgent:
         # directives in platform adapters.
         self._mr_request_id = None
         self._mr_task_type = None
+        self._mr_mode = None
         self._mr_start_time = None
         self._mr_som_state_dir = None
         self._mr_original_task = None
@@ -8760,7 +8849,15 @@ class AIAgent:
         self._mr_context_brief_path = None
         _mr_platform = getattr(self, "platform", None) or "cli"
         _mr_source = "cli" if _mr_platform == "cli" else "gateway"
-        if user_message and not user_message.startswith("[META-ROUTER |"):
+        _prefixed_directive, _prefixed_type, _prefixed_mode = _parse_meta_router_directive(user_message)
+        if _prefixed_directive:
+            self._mr_directive = _prefixed_directive
+            self._mr_task_type = _prefixed_type
+            self._mr_mode = _prefixed_mode
+            self._mr_original_task = user_message
+            if persist_user_message is None:
+                persist_user_message = user_message
+        elif user_message:
             try:
                 import time as _mr_time
                 _mr_t0 = _mr_time.time()
@@ -8779,6 +8876,7 @@ class AIAgent:
                     user_message = f"{_mr_prepend}\n{user_message}"
                     self._mr_request_id = _mr_dec.request_id
                     self._mr_task_type = _mr_dec.type
+                    self._mr_mode = getattr(_mr_dec, "mode", None)
                     self._mr_start_time = _mr_t0
                     self._mr_original_task = _mr_original
                     self._mr_routing_artifact_version = getattr(_mr_dec, "routing_artifact_version", None)
@@ -8825,6 +8923,8 @@ class AIAgent:
                             pass  # Phase 1 failure is non-fatal
             except Exception:
                 pass  # meta-router runtime unavailable — proceed without directive
+
+        self._apply_turn_tool_policy()
 
         # Store stream callback for _interruptible_api_call to pick up
         self._stream_callback = stream_callback
@@ -12063,9 +12163,11 @@ class AIAgent:
                 except Exception:
                     pass
             finally:
+                self._reset_turn_tools()
                 self._mr_request_id = None
                 self._mr_som_state_dir = None
                 self._mr_task_type = None
+                self._mr_mode = None
                 self._mr_start_time = None
                 self._mr_original_task = None
                 self._mr_routing_artifact_version = None

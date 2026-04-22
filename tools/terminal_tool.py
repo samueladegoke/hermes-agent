@@ -784,6 +784,16 @@ def _parse_env_var(name: str, default: str, converter=int, type_label: str = "in
         )
 
 
+def _preferred_tool_cwd(default_cwd: str) -> str:
+    messaging_cwd = (os.getenv("MESSAGING_CWD") or "").strip()
+    if messaging_cwd:
+        return messaging_cwd
+    terminal_cwd = (os.getenv("TERMINAL_CWD") or "").strip()
+    if terminal_cwd:
+        return terminal_cwd
+    return default_cwd
+
+
 def _get_env_config() -> Dict[str, Any]:
     """Get terminal environment configuration from environment variables."""
     # Default image with Python and Node.js for maximum compatibility
@@ -802,15 +812,14 @@ def _get_env_config() -> Dict[str, Any]:
     else:
         default_cwd = "/root"
 
-    # Read TERMINAL_CWD but sanity-check it for container backends.
-    # If Docker cwd passthrough is explicitly enabled, remap the host path to
-    # /workspace and track the original host path separately. Otherwise keep the
-    # normal sandbox behavior and discard host paths.
-    cwd = os.getenv("TERMINAL_CWD", default_cwd)
+    # Read the gateway/user-facing cwd first, then fall back to TERMINAL_CWD.
+    # This keeps terminal() aligned with messaging-session intent instead of the
+    # long-lived service repo cwd when both are present.
+    cwd = _preferred_tool_cwd(default_cwd)
     host_cwd = None
     host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
     if env_type == "docker" and mount_docker_cwd:
-        docker_cwd_source = os.getenv("TERMINAL_CWD") or os.getcwd()
+        docker_cwd_source = _preferred_tool_cwd(os.getcwd())
         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
         if (
             any(candidate.startswith(p) for p in host_prefixes)

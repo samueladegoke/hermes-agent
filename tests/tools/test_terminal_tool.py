@@ -103,3 +103,31 @@ def test_validate_workdir_blocks_shell_metacharacters_in_windows_paths():
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project; rm -rf /")
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project$(whoami)")
     assert terminal_tool._validate_workdir("C:\\Users\\Alice\\project\nwhoami")
+
+
+def test_get_env_config_prefers_messaging_cwd_over_terminal_cwd(monkeypatch, tmp_path):
+    messaging_cwd = tmp_path / "messaging"
+    terminal_cwd = tmp_path / "terminal"
+    messaging_cwd.mkdir()
+    terminal_cwd.mkdir()
+
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("MESSAGING_CWD", str(messaging_cwd))
+    monkeypatch.setenv("TERMINAL_CWD", str(terminal_cwd))
+
+    cfg = terminal_tool._get_env_config()
+
+    assert cfg["cwd"] == str(messaging_cwd)
+
+
+def test_get_env_config_falls_back_to_terminal_cwd_when_messaging_cwd_blank(monkeypatch, tmp_path):
+    terminal_cwd = tmp_path / "terminal"
+    terminal_cwd.mkdir()
+
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("MESSAGING_CWD", "   ")
+    monkeypatch.setenv("TERMINAL_CWD", str(terminal_cwd))
+
+    cfg = terminal_tool._get_env_config()
+
+    assert cfg["cwd"] == str(terminal_cwd)
