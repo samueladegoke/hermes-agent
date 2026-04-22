@@ -160,3 +160,15 @@ class TestSnapshotEndToEnd:
         output = result.get("output", "")
         assert "PROBE=probe-ok" in output
         assert "/opt/shell-init-probe/bin" in output
+
+    def test_snapshot_honors_requested_initial_cwd(self, tmp_path):
+        requested_cwd = tmp_path / "requested-cwd"
+        requested_cwd.mkdir()
+
+        env = LocalEnvironment(cwd=str(requested_cwd), timeout=15)
+        try:
+            result = env.execute("pwd")
+        finally:
+            env.cleanup()
+
+        assert result.get("output", "").strip() == str(requested_cwd)
