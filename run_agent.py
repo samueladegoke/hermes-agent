@@ -78,6 +78,60 @@ from tools.browser_tool import cleanup_browser
 
 from hermes_constants import OPENROUTER_BASE_URL
 
+_META_ROUTER_DIRECTIVE_RE = re.compile(r"^\[META-ROUTER\s*\|\s*([^|\]]+)\s*\|\s*([^\]]+)\]")
+
+# Review-mode turns should stay read-only. Keep the tool surface narrow and
+# investigative so routed code reviews cannot silently mutate files, processes,
+# external services, or memory/state.
+_REVIEW_SAFE_TOOL_NAMES = frozenset({
+    "read_file",
+    "search_files",
+    "session_search",
+    "skills_list",
+    "skill_view",
+    "web_search",
+    "web_extract",
+    "vision_analyze",
+    "browser_navigate",
+    "browser_snapshot",
+    "browser_get_images",
+    "browser_scroll",
+    "browser_back",
+    "browser_vision",
+    "memory_search",
+    "memory_get",
+    "qmd__query",
+    "qmd__get",
+    "supermemory_search",
+    "open-brain__recall",
+})
+
+
+def _parse_meta_router_directive(text: str | None) -> tuple[str | None, str | None, str | None]:
+    if not isinstance(text, str) or not text:
+        return None, None, None
+    first_line = text.splitlines()[0].strip()
+    match = _META_ROUTER_DIRECTIVE_RE.match(first_line)
+    if not match:
+        return None, None, None
+    task_type = match.group(1).strip().lower() or None
+    mode = match.group(2).strip().lower() or None
+    return first_line, task_type, mode
+
+
+def _preferred_session_cwd(platform: str | None) -> str:
+    platform_name = str(platform or "cli").strip().lower() or "cli"
+    messaging_cwd = (os.getenv("MESSAGING_CWD") or "").strip()
+    terminal_cwd = (os.getenv("TERMINAL_CWD") or "").strip()
+    if platform_name != "cli" and messaging_cwd:
+        return messaging_cwd
+    if terminal_cwd:
+        return terminal_cwd
+    if messaging_cwd:
+        return messaging_cwd
+    return os.getcwd()
+
+
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import build_memory_context_block, sanitize_context
 from agent.retry_utils import jittered_backoff
@@ -1548,6 +1602,14 @@ class AIAgent:
             _agent_section = {}
         self._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
+        # Dedicated coding-harness routing config. This powers the Hermes →
+        # OMX/Codex handoff for routed code tasks. The helper methods further
+        # down (`_omx_executor_enabled()` / `_omx_command_override()`) read from
+        # `self._code_harness_cfg`, so keep the loaded config on the instance
+        # instead of requiring an env-var-only rollout.
+        _code_harness_cfg = _agent_cfg.get("code_harness", {})
+        self._code_harness_cfg = _code_harness_cfg if isinstance(_code_harness_cfg, dict) else {}
+
         # Initialize context compressor for automatic context management
         # Compresses conversation when approaching model's context limit
         # Configuration via config.yaml (compression section)
@@ -1741,6 +1803,12 @@ class AIAgent:
                     self.valid_tool_names.add(_tname)
                     self._context_engine_tool_names.add(_tname)
 
+        # Keep the full discovered tool surface so turn-scoped routing policies
+        # (for example review-mode read-only filtering) can narrow tools during a
+        # single turn without permanently mutating cached gateway agents.
+        self._base_tools = list(self.tools or [])
+        self._base_valid_tool_names = set(self.valid_tool_names or set())
+
         # Notify context engine of session start
         if hasattr(self, "context_compressor") and self.context_compressor:
             try:
@@ -1755,7 +1823,7 @@ class AIAgent:
                 logger.debug("Context engine on_session_start: %s", _ce_err)
 
         self._subdirectory_hints = SubdirectoryHintTracker(
-            working_dir=os.getenv("TERMINAL_CWD") or None,
+            working_dir=_preferred_session_cwd(self.platform),
         )
         self._user_turn_count = 0
 
@@ -4113,11 +4181,10 @@ class AIAgent:
             prompt_parts.append(skills_prompt)
 
         if not self.skip_context_files:
-            # Use TERMINAL_CWD for context file discovery when set (gateway
-            # mode).  The gateway process runs from the hermes-agent install
-            # dir, so os.getcwd() would pick up the repo's AGENTS.md and
-            # other dev files — inflating token usage by ~10k for no benefit.
-            _context_cwd = os.getenv("TERMINAL_CWD") or None
+            # Prefer the user-facing messaging cwd for gateway sessions so
+            # context file discovery reflects the actual chat/workspace target
+            # rather than the long-lived hermes-agent service repo checkout.
+            _context_cwd = _preferred_session_cwd(self.platform)
             context_files_prompt = build_context_files_prompt(
                 cwd=_context_cwd, skip_soul=_soul_loaded)
             if context_files_prompt:
@@ -7768,7 +7835,7 @@ class AIAgent:
                 try:
                     cmd = function_args.get("command", "")
                     if _is_destructive_command(cmd):
-                        cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
+                        cwd = function_args.get("workdir") or _preferred_session_cwd(self.platform)
                         self._checkpoint_mgr.ensure_checkpoint(
                             cwd, f"before terminal: {cmd[:60]}"
                         )
@@ -8122,7 +8189,7 @@ class AIAgent:
                 try:
                     cmd = function_args.get("command", "")
                     if _is_destructive_command(cmd):
-                        cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
+                        cwd = function_args.get("workdir") or _preferred_session_cwd(self.platform)
                         self._checkpoint_mgr.ensure_checkpoint(
                             cwd, f"before terminal: {cmd[:60]}"
                         )
@@ -8572,6 +8639,108 @@ class AIAgent:
 
         return final_response
 
+    def _reset_turn_tools(self) -> None:
+        self.tools = list(getattr(self, "_base_tools", []) or [])
+        self.valid_tool_names = set(getattr(self, "_base_valid_tool_names", set()) or set())
+
+    def _apply_turn_tool_policy(self) -> None:
+        self._reset_turn_tools()
+        if str(getattr(self, "_mr_mode", "") or "").strip().lower() != "review":
+            return
+        filtered_tools = []
+        filtered_names = set()
+        for tool in self.tools or []:
+            name = tool.get("function", {}).get("name") if isinstance(tool, dict) else None
+            if name in _REVIEW_SAFE_TOOL_NAMES:
+                filtered_tools.append(tool)
+                filtered_names.add(name)
+        self.tools = filtered_tools
+        self.valid_tool_names = filtered_names
+
+    def _omx_executor_enabled(self) -> bool:
+        env_value = str(os.getenv("HERMES_ENABLE_OMX_EXECUTOR", "")).strip().lower()
+        if env_value:
+            return env_value in {"1", "true", "yes", "on"}
+
+        cfg = getattr(self, "_code_harness_cfg", {})
+        if not isinstance(cfg, dict):
+            return False
+        if not bool(cfg.get("enabled", False)):
+            return False
+        default_engine = str(cfg.get("default", "")).strip().lower()
+        return default_engine == "omx"
+
+    def _omx_command_override(self) -> Optional[str]:
+        env_value = str(os.getenv("HERMES_OMX_COMMAND", "")).strip()
+        if env_value:
+            return env_value
+        cfg = getattr(self, "_code_harness_cfg", {})
+        if not isinstance(cfg, dict):
+            return None
+        omx_cfg = cfg.get("omx", {})
+        if not isinstance(omx_cfg, dict):
+            return None
+        command_value = str(omx_cfg.get("command", "")).strip()
+        return command_value or None
+
+    def _should_handoff_to_omx(self) -> bool:
+        if not self._omx_executor_enabled():
+            return False
+        if getattr(self, "_mr_task_type", None) != "code":
+            return False
+        if str(getattr(self, "_mr_mode", "") or "").strip().lower() != "execute":
+            return False
+        return bool(
+            getattr(self, "_mr_request_id", None)
+            and getattr(self, "_mr_som_state_dir", None)
+            and getattr(self, "_mr_original_task", None)
+        )
+
+    def _run_omx_handoff(self, correction_task_text: Optional[str] = None) -> tuple[Optional[str], dict]:
+        from gateway.omx_executor import build_execution_request, execute_request
+
+        state_dir = Path(str(self._mr_som_state_dir))
+        base_task_text = str(getattr(self, "_mr_original_task", "") or "")
+        if correction_task_text:
+            task_text = (
+                f"Original task:\n{base_task_text}\n\n"
+                f"Correction instructions:\n{correction_task_text}"
+            ).strip()
+        else:
+            task_text = base_task_text
+        request = build_execution_request(
+            request_id=str(getattr(self, "_mr_request_id", "") or ""),
+            task_type=str(getattr(self, "_mr_task_type", "code") or "code"),
+            mode=str(getattr(self, "_mr_mode", "execute") or "execute"),
+            directive=str(getattr(self, "_mr_directive", "") or ""),
+            routing_artifact_version=str(getattr(self, "_mr_routing_artifact_version", "static-default") or "static-default"),
+            session_id=getattr(self, "session_id", None),
+            state_dir=state_dir,
+            targets_context=str(getattr(self, "_mr_targets_context", "") or ""),
+            task_text=task_text,
+            context_brief_path=getattr(self, "_mr_context_brief_path", None),
+        )
+        _mr_platform = getattr(self, "platform", None) or "cli"
+        handoff_workdir = (
+            (os.getenv("MESSAGING_CWD") or os.getenv("TERMINAL_CWD"))
+            if _mr_platform != "cli"
+            else (os.getenv("TERMINAL_CWD") or os.getenv("MESSAGING_CWD"))
+        ) or os.getcwd()
+        exec_result = execute_request(
+            request,
+            workdir=handoff_workdir,
+            command_override=self._omx_command_override(),
+        )
+        output_path = Path(str(exec_result.get("output_path") or request["output_path"]))
+        if output_path.exists():
+            response_text = output_path.read_text(encoding="utf-8").strip()
+        else:
+            response_text = ""
+        if not response_text:
+            return None, exec_result
+        return response_text, exec_result
+
+
     def run_conversation(
         self,
         user_message: str,
@@ -8631,6 +8800,99 @@ class AIAgent:
             user_message = sanitize_context(user_message)
         if isinstance(persist_user_message, str):
             persist_user_message = sanitize_context(persist_user_message)
+
+        # meta-router: pre-classify Hermes turns with the shared MR-ALS runtime.
+        # Direct classify (no HTTP) + RouteDecision + event logging + SoM Phase 1.
+        # Gateway surfaces should flow through this same path; do not pre-inject
+        # directives in platform adapters.
+        self._mr_request_id = None
+        self._mr_task_type = None
+        self._mr_mode = None
+        self._mr_start_time = None
+        self._mr_som_state_dir = None
+        self._mr_original_task = None
+        self._mr_routing_artifact_version = None
+        self._mr_directive = None
+        self._mr_targets_context = None
+        self._mr_context_brief_path = None
+        _mr_platform = getattr(self, "platform", None) or "cli"
+        _mr_source = "cli" if _mr_platform == "cli" else "gateway"
+        _prefixed_directive, _prefixed_type, _prefixed_mode = _parse_meta_router_directive(user_message)
+        if _prefixed_directive:
+            self._mr_directive = _prefixed_directive
+            self._mr_task_type = _prefixed_type
+            self._mr_mode = _prefixed_mode
+            self._mr_original_task = user_message
+            if persist_user_message is None:
+                persist_user_message = user_message
+        elif user_message:
+            try:
+                import time as _mr_time
+                _mr_t0 = _mr_time.time()
+                from gateway.meta_router_runtime import make_route_decision as _mr_decide
+                _mr_dec = _mr_decide(
+                    text=user_message,
+                    source=_mr_source,
+                    surface=_mr_platform,
+                    session_id=getattr(self, "session_id", None),
+                )
+                _mr_prepend = getattr(_mr_dec, "prepend_text", None) or _mr_dec.directive
+                _mr_original = user_message
+                if persist_user_message is None:
+                    persist_user_message = _mr_original
+                if not _mr_dec.bypassed and _mr_prepend:
+                    user_message = f"{_mr_prepend}\n{user_message}"
+                    self._mr_request_id = _mr_dec.request_id
+                    self._mr_task_type = _mr_dec.type
+                    self._mr_mode = getattr(_mr_dec, "mode", None)
+                    self._mr_start_time = _mr_t0
+                    self._mr_original_task = _mr_original
+                    self._mr_routing_artifact_version = getattr(_mr_dec, "routing_artifact_version", None)
+                    self._mr_directive = _mr_dec.directive
+                    # Phase 1: generate SoM targets (fast, rule-based — no LLM)
+                    if len(_mr_original) >= 40 and _mr_dec.confidence >= 0.35:
+                        try:
+                            from gateway.meta_router_executor import run_phase1 as _mr_p1
+                            _prep = _mr_p1(_mr_original, _mr_dec.type)
+                            if _prep.phase1_ok and _prep.targets_context:
+                                self._mr_som_state_dir = _prep.state_dir
+                                self._mr_targets_context = _prep.targets_context
+                                # Phase 1b: pre-execution context brief
+                                # For research/audit/production tasks, gather relevant
+                                # context BEFORE Hermes runs so it knows where to look
+                                # rather than discovering everything through tool calls.
+                                _mr_ctx_brief = None
+                                try:
+                                    from gateway.meta_router_context import (
+                                        gather_pre_execution_context as _mr_gather_ctx,
+                                    )
+                                    _mr_ctx_brief = _mr_gather_ctx(
+                                        task_text=_mr_original,
+                                        task_type=_mr_dec.type,
+                                        state_dir=_prep.state_dir,
+                                    )
+                                except Exception:
+                                    pass  # context gather is non-fatal
+                                if _mr_ctx_brief:
+                                    self._mr_context_brief_path = str(Path(_prep.state_dir) / "context_brief.json")
+                                    user_message = (
+                                        f"{_mr_prepend}\n\n"
+                                        f"{_prep.targets_context}\n\n"
+                                        f"[CONTEXT BRIEF]\n{_mr_ctx_brief}\n\n"
+                                        f"{_mr_original}"
+                                    )
+                                else:
+                                    user_message = (
+                                        f"{_mr_prepend}\n\n"
+                                        f"{_prep.targets_context}\n\n"
+                                        f"{_mr_original}"
+                                    )
+                        except Exception:
+                            pass  # Phase 1 failure is non-fatal
+            except Exception:
+                pass  # meta-router runtime unavailable — proceed without directive
+
+        self._apply_turn_tool_policy()
 
         # Store stream callback for _interruptible_api_call to pick up
         self._stream_callback = stream_callback
@@ -8901,6 +9163,32 @@ class AIAgent:
         truncated_response_prefix = ""
         compression_attempts = 0
         _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+
+        # Optional external code-harness shortcut.
+        # When enabled, Hermes still owns routing + Phase 1/2 and simply
+        # delegates the middle execution step to OMX for routed code tasks.
+        if self._should_handoff_to_omx():
+            try:
+                _omx_response, _omx_exec_result = self._run_omx_handoff()
+                if _omx_response:
+                    final_response = _omx_response
+                    messages.append({"role": "assistant", "content": final_response})
+                    _turn_exit_reason = f"omx_executor_{str(_omx_exec_result.get('status') or 'completed')}"
+                else:
+                    _turn_exit_reason = f"omx_executor_{str(_omx_exec_result.get('status') or 'failed')}_fallback"
+                    logging.warning(
+                        "OMX handoff produced no output artifacts for request %s; falling back to native execution. Result=%s",
+                        getattr(self, "_mr_request_id", None),
+                        _omx_exec_result,
+                    )
+            except Exception as _omx_exc:
+                _turn_exit_reason = f"omx_executor_exception({type(_omx_exc).__name__})_fallback"
+                logging.warning(
+                    "OMX handoff raised %s for request %s; falling back to native execution.",
+                    type(_omx_exc).__name__,
+                    getattr(self, "_mr_request_id", None),
+                    exc_info=True,
+                )
         
         # Record the execution thread so interrupt()/clear_interrupt() can
         # scope the tool-level interrupt signal to THIS agent's thread only.
@@ -8941,7 +9229,7 @@ class AIAgent:
             except Exception:
                 pass
 
-        while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
+        while final_response is None and ((api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call):
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
             self._checkpoint_mgr.new_turn()
 
@@ -11760,6 +12048,168 @@ class AIAgent:
         self._cleanup_task_resources(effective_task_id)
 
         # Persist session to both JSON log and SQLite
+        self._persist_session(messages, conversation_history)
+
+
+        # MR-ALS post-turn: SoM Phase 2 scoring + outcome logging + receipt formatting.
+        # Reentrancy guard: when a correction pass re-enters run_conversation, the outer
+        # call still owns phase2 evaluation — inner calls must return their draft verbatim.
+        _mr_rid = getattr(self, "_mr_request_id", None)
+        _mr_in_correction = getattr(self, "_mr_in_correction", False)
+        if _mr_rid and not _mr_in_correction:
+            try:
+                from gateway.meta_router_executor import (
+                    format_routed_response as _mr_fmt,
+                    run_phase2 as _mr_p2,
+                    run_outcome_only as _mr_out_only,
+                )
+                _mr_sdir = getattr(self, "_mr_som_state_dir", None)
+                _mr_tt = getattr(self, "_mr_task_type", None) or "research"
+                _mr_t0 = getattr(self, "_mr_start_time", None) or 0.0
+                _mr_otask = getattr(self, "_mr_original_task", None) or ""
+                _mr_art = getattr(self, "_mr_routing_artifact_version", None) or "static-default"
+                _mr_sid = getattr(self, "session_id", None)
+                _mr_directive = getattr(self, "_mr_directive", None) or ""
+                _mr_platform = getattr(self, "platform", None) or "cli"
+                _mr_source = "cli" if _mr_platform == "cli" else "gateway"
+                _mr_effective_empty = (
+                    not final_response
+                    or not str(final_response).strip()
+                    or str(final_response).strip() == "(empty)"
+                )
+                if _mr_effective_empty:
+                    _mr_out_only(
+                        request_id=_mr_rid,
+                        task_type=_mr_tt,
+                        t0=_mr_t0,
+                        routing_artifact_version=_mr_art,
+                        session_id=_mr_sid,
+                        source=_mr_source,
+                        surface=_mr_platform,
+                        error="missing-final-response",
+                        notes_extra=["phase=missing-final-response"],
+                    )
+                    final_response = ""
+                elif _mr_sdir and _mr_otask:
+                    _MR_MAX_FIX_PASSES = 2
+                    _mr_fix_pass = 0
+                    _mr_phase2 = _mr_p2(
+                        _mr_rid, _mr_tt, _mr_otask, _mr_sdir,
+                        final_response, _mr_t0, _mr_art, _mr_sid, _mr_source, _mr_platform,
+                    )
+                    while (
+                        not _mr_phase2.passed
+                        and _mr_fix_pass < _MR_MAX_FIX_PASSES
+                        and _mr_phase2.fix_prompt_path
+                    ):
+                        _mr_fix_pass += 1
+                        try:
+                            from pathlib import Path as _MRPath
+                            _fix_instructions = _MRPath(_mr_phase2.fix_prompt_path).read_text(encoding="utf-8")
+                            _score_str = f"{_mr_phase2.score:.0f}" if _mr_phase2.score is not None else "?"
+                            _thresh_str = f"{_mr_phase2.threshold:.0f}" if _mr_phase2.threshold is not None else "?"
+                            _fix_prefix = (
+                                f"CORRECTION PASS {_mr_fix_pass}/{_MR_MAX_FIX_PASSES} — "
+                                f"Score was {_score_str}/{_thresh_str}, revision needed before delivery.\n\n"
+                                f"{_fix_instructions}\n\n"
+                                f"Revise and restate your complete response below."
+                            )
+                            _fix_response = ""
+                            _use_omx_correction = (
+                                _mr_tt == "code"
+                                and self._omx_executor_enabled()
+                                and getattr(self, "_mr_som_state_dir", None)
+                            )
+                            if _use_omx_correction:
+                                _fix_response, _fix_exec_result = self._run_omx_handoff(
+                                    correction_task_text=_fix_prefix,
+                                )
+                                if not _fix_response:
+                                    raise RuntimeError(
+                                        f"OMX correction pass produced no output: {_fix_exec_result}"
+                                    )
+                            else:
+                                self._mr_in_correction = True
+                                try:
+                                    _fix_result = self.run_conversation(
+                                        user_message=_fix_prefix,
+                                        conversation_history=list(messages),
+                                        persist_user_message="[MR correction pass — not user-visible]",
+                                    )
+                                finally:
+                                    self._mr_in_correction = False
+                                _fix_response = (_fix_result.get("final_response") or "").strip()
+                            if _fix_response:
+                                final_response = _fix_response
+                                try:
+                                    (_MRPath(_mr_sdir) / "output.md").write_text(final_response, encoding="utf-8")
+                                except Exception:
+                                    pass
+                                _mr_phase2 = _mr_p2(
+                                    _mr_rid, _mr_tt, _mr_otask, _mr_sdir,
+                                    final_response, _mr_t0, _mr_art, _mr_sid, _mr_source, _mr_platform,
+                                )
+                        except Exception as _mr_fix_exc:
+                            import logging as _mr_logging
+                            _mr_logging.getLogger("meta_router").warning(
+                                "MR correction pass %d failed: %s", _mr_fix_pass, _mr_fix_exc
+                            )
+                            break
+                    final_response = _mr_fmt(final_response, _mr_phase2, directive=_mr_directive)
+                    for _mr_msg in reversed(messages):
+                        if _mr_msg.get("role") == "assistant":
+                            _mr_msg["content"] = final_response
+                            break
+                else:
+                    _mr_out_only(
+                        request_id=_mr_rid,
+                        task_type=_mr_tt,
+                        t0=_mr_t0,
+                        routing_artifact_version=_mr_art,
+                        session_id=_mr_sid,
+                        source=_mr_source,
+                        surface=_mr_platform,
+                    )
+            except Exception as _mr_p2_exc:
+                import logging as _mr_logging
+                _mr_logging.getLogger("meta_router").warning(
+                    "MR phase2 block failed: %s", _mr_p2_exc
+                )
+                try:
+                    from gateway.meta_router_executor import run_outcome_only as _mr_out_only_fallback
+                    _mr_platform = getattr(self, "platform", None) or "cli"
+                    _mr_source = "cli" if _mr_platform == "cli" else "gateway"
+                    _mr_out_only_fallback(
+                        request_id=_mr_rid,
+                        task_type=getattr(self, "_mr_task_type", None) or "research",
+                        t0=getattr(self, "_mr_start_time", None) or 0.0,
+                        routing_artifact_version=getattr(self, "_mr_routing_artifact_version", None) or "static-default",
+                        session_id=getattr(self, "session_id", None),
+                        source=_mr_source,
+                        surface=_mr_platform,
+                        error="phase2-block-exception",
+                        notes_extra=[
+                            "phase=phase2-exception",
+                            f"phase2_exception={str(_mr_p2_exc)[:160]}",
+                        ],
+                    )
+                except Exception:
+                    pass
+            finally:
+                self._reset_turn_tools()
+                self._mr_request_id = None
+                self._mr_som_state_dir = None
+                self._mr_task_type = None
+                self._mr_mode = None
+                self._mr_start_time = None
+                self._mr_original_task = None
+                self._mr_routing_artifact_version = None
+                self._mr_directive = None
+                self._mr_targets_context = None
+                self._mr_context_brief_path = None
+
+        # Re-persist after MR post-turn processing so session JSON/SQLite reflect
+        # the final user-visible answer rather than the pre-evaluation draft.
         self._persist_session(messages, conversation_history)
 
         # ── Turn-exit diagnostic log ─────────────────────────────────────

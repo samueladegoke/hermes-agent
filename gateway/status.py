@@ -217,7 +217,7 @@ def _cleanup_invalid_pid_path(pid_path: Path, *, cleanup_stale: bool) -> None:
         return
     try:
         if pid_path == _get_pid_path():
-            remove_pid_file()
+            remove_pid_file(force=True)
         else:
             pid_path.unlink(missing_ok=True)
     except Exception:
@@ -259,6 +259,7 @@ def write_runtime_status(
     platform_state: Any = _UNSET,
     error_code: Any = _UNSET,
     error_message: Any = _UNSET,
+    platform_details: Any = _UNSET,
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
@@ -286,6 +287,8 @@ def write_runtime_status(
             platform_payload["error_code"] = error_code
         if error_message is not _UNSET:
             platform_payload["error_message"] = error_message
+        if platform_details is not _UNSET:
+            platform_payload["details"] = platform_details
         platform_payload["updated_at"] = _utc_now_iso()
         payload["platforms"][platform] = platform_payload
 
@@ -297,25 +300,27 @@ def read_runtime_status() -> Optional[dict[str, Any]]:
     return _read_json_file(_get_runtime_status_path())
 
 
-def remove_pid_file() -> None:
-    """Remove the gateway PID file, but only if it belongs to this process.
+def remove_pid_file(*, force: bool = False) -> None:
+    """Remove the gateway PID file.
 
-    During --replace handoffs, the old process's atexit handler can fire AFTER
-    the new process has written its own PID file.  Blindly removing the file
-    would delete the new process's record, leaving the gateway running with no
-    PID file (invisible to ``get_running_pid()``).
+    By default the file is only removed if it belongs to this process.
+    This protects the new gateway instance during --replace handoffs.
+
+    When ``force=True`` is used, stale/invalid/dead foreign PID records are
+    removed explicitly by the caller (for example from ``get_running_pid()``
+    after proving the recorded process is gone or invalid).
     """
     try:
         path = _get_pid_path()
-        record = _read_json_file(path)
-        if record is not None:
-            try:
-                file_pid = int(record["pid"])
-            except (KeyError, TypeError, ValueError):
-                file_pid = None
-            if file_pid is not None and file_pid != os.getpid():
-                # PID file belongs to a different process — leave it alone.
-                return
+        if not force:
+            record = _read_json_file(path)
+            if record is not None:
+                try:
+                    file_pid = int(record["pid"])
+                except (KeyError, TypeError, ValueError):
+                    file_pid = None
+                if file_pid is not None and file_pid != os.getpid():
+                    return
         path.unlink(missing_ok=True)
     except Exception:
         pass

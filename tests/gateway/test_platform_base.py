@@ -321,6 +321,12 @@ class TestExtractMedia:
         assert "Here" in cleaned
         assert "After" in cleaned
 
+    def test_media_placeholder_is_not_extracted(self):
+        content = "The docs mention MEDIA:<path> and MEDIA:\\ as examples."
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == []
+        assert cleaned == content
+
 
 # ---------------------------------------------------------------------------
 # truncate_message

@@ -79,13 +79,27 @@ _BLOCKED_DEVICE_PATHS = frozenset({
 })
 
 
-def _resolve_path(filepath: str) -> Path:
-    """Resolve a path relative to TERMINAL_CWD (the worktree base directory)
-    instead of the main repository root.
+def _preferred_gateway_cwd() -> str:
+    """Return the cwd that best matches gateway/user-facing intent.
+
+    Gateway turns may carry both MESSAGING_CWD and TERMINAL_CWD. Prefer the
+    messaging cwd when present so relative file paths resolve against the user-
+    facing chat/session directory instead of the long-lived service repo cwd.
     """
+    messaging_cwd = (os.environ.get("MESSAGING_CWD") or "").strip()
+    if messaging_cwd:
+        return messaging_cwd
+    terminal_cwd = (os.environ.get("TERMINAL_CWD") or "").strip()
+    if terminal_cwd:
+        return terminal_cwd
+    return os.getcwd()
+
+
+def _resolve_path(filepath: str) -> Path:
+    """Resolve a path relative to the active tool cwd instead of the repo root."""
     p = Path(filepath).expanduser()
     if not p.is_absolute():
-        base = os.environ.get("TERMINAL_CWD", os.getcwd())
+        base = _preferred_gateway_cwd()
         p = Path(base) / p
     return p.resolve()
 

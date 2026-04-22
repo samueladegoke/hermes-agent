@@ -13,6 +13,7 @@ from tools.file_tools import (
     WRITE_FILE_SCHEMA,
     PATCH_SCHEMA,
     SEARCH_FILES_SCHEMA,
+    _resolve_path,
 )
 
 
@@ -319,6 +320,32 @@ class TestSearchHints:
         raw = search_tool(pattern="foo", offset=50, limit=50)
         assert "[Hint:" in raw
         assert "offset=100" in raw
+
+
+class TestGatewayCwdResolution:
+    def test_resolve_path_prefers_messaging_cwd_over_terminal_cwd(self, monkeypatch, tmp_path):
+        messaging_cwd = tmp_path / "messaging"
+        terminal_cwd = tmp_path / "terminal"
+        messaging_cwd.mkdir()
+        terminal_cwd.mkdir()
+
+        monkeypatch.setenv("MESSAGING_CWD", str(messaging_cwd))
+        monkeypatch.setenv("TERMINAL_CWD", str(terminal_cwd))
+
+        resolved = _resolve_path("probe.txt")
+
+        assert resolved == (messaging_cwd / "probe.txt").resolve()
+
+    def test_resolve_path_falls_back_to_terminal_cwd_when_messaging_cwd_blank(self, monkeypatch, tmp_path):
+        terminal_cwd = tmp_path / "terminal"
+        terminal_cwd.mkdir()
+
+        monkeypatch.setenv("MESSAGING_CWD", "   ")
+        monkeypatch.setenv("TERMINAL_CWD", str(terminal_cwd))
+
+        resolved = _resolve_path("probe.txt")
+
+        assert resolved == (terminal_cwd / "probe.txt").resolve()
 
 
 
