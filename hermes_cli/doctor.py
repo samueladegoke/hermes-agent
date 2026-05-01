@@ -59,8 +59,11 @@ _PROVIDER_ENV_HINTS = (
     "OPENCODE_ZEN_API_KEY",
     "OPENCODE_GO_API_KEY",
     "XIAOMI_API_KEY",
-    "TOKENHUB_API_KEY",
-)
+    "TOKENHUB_API_KEY",    "EXA_API_KEY",
+    "PARALLEL_API_KEY",
+    "FIRECRAWL_API_KEY",
+    "FIRECRAWL_API_URL",
+    "TAVILY_API_KEY",)
 
 
 from hermes_constants import is_termux as _is_termux

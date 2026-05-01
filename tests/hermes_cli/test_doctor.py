@@ -35,15 +35,19 @@ class TestDoctorPlatformHints:
 
 class TestProviderEnvDetection:
     def test_detects_openai_api_key(self):
-        content = "OPENAI_BASE_URL=http://localhost:1234/v1\nOPENAI_API_KEY=***"
+        content = "OPENAI_BASE_URL=http://localhost:1234/v1\nOPENAI_API_KEY=***\n"
         assert _has_provider_env_config(content)
 
     def test_detects_custom_endpoint_without_openrouter_key(self):
         content = "OPENAI_BASE_URL=http://localhost:8080/v1\n"
         assert _has_provider_env_config(content)
 
+    def test_detects_tavily_api_key(self):
+        content = "TAVILY_API_KEY=tvly-d...e\n"
+        assert _has_provider_env_config(content)
+
     def test_detects_kimi_cn_api_key(self):
-        content = "KIMI_CN_API_KEY=sk-test\n"
+        content = "KIMI_CN_API_KEY=***\n"
         assert _has_provider_env_config(content)
 
     def test_returns_false_when_no_provider_settings(self):

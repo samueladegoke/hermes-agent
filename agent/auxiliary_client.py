@@ -480,11 +480,23 @@ class _CodexCompletionsAdapter:
             content = msg.get("content") or ""
             if role == "system":
                 instructions = content if isinstance(content, str) else str(content)
-            else:
-                input_msgs.append({
-                    "role": role,
-                    "content": _convert_content_for_responses(content),
-                })
+                continue
+
+            # Chat Completions history can contain `tool` result messages, but
+            # the ChatGPT-backed Codex Responses endpoint only accepts
+            # assistant/system/developer/user input roles. Preserve the evidence
+            # as plain transcript text instead of forwarding an invalid role.
+            if role == "tool":
+                role = "user"
+                tool_id = msg.get("tool_call_id") or msg.get("tool_name") or "unknown"
+                content = f"[Tool result: {tool_id}]\n{content}"
+            elif role not in {"assistant", "developer", "user"}:
+                role = "user"
+
+            input_msgs.append({
+                "role": role,
+                "content": _convert_content_for_responses(content),
+            })
 
         resp_kwargs: Dict[str, Any] = {
             "model": model,

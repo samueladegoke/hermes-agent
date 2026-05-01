@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
@@ -547,6 +548,69 @@ class TestGetTextAuxiliaryClient:
         assert model == "gpt-5.3-codex"
         assert mock_openai.call_args.kwargs["base_url"] == "https://api.openai.com/v1"
         assert mock_openai.call_args.kwargs["api_key"] == "sk-test"
+
+
+class TestCodexCompletionsAdapter:
+    def test_tool_role_history_is_converted_to_user_text_for_responses_api(self):
+        """Codex Responses input must never receive raw chat-completions tool roles."""
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        captured_kwargs = {}
+
+        class _FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                return iter(())
+
+            def get_final_response(self):
+                return SimpleNamespace(
+                    output=[SimpleNamespace(
+                        type="message",
+                        content=[SimpleNamespace(type="output_text", text="AUX_FLUSH_OK")],
+                    )],
+                    usage=None,
+                )
+
+        class _FakeResponses:
+            def stream(self, **kwargs):
+                captured_kwargs.update(kwargs)
+                return _FakeStream()
+
+        fake_client = SimpleNamespace(responses=_FakeResponses())
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.4")
+
+        response = adapter.create(
+            messages=[
+                {"role": "system", "content": "Follow instructions."},
+                {"role": "user", "content": "Save this."},
+                {"role": "assistant", "content": "Saved."},
+                {"role": "tool", "tool_call_id": "call_memory", "content": '{"success": true}'},
+                {"role": "user", "content": "Reply exactly AUX_FLUSH_OK"},
+            ],
+            tools=[{
+                "type": "function",
+                "function": {
+                    "name": "memory",
+                    "description": "Save durable memory",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }],
+        )
+
+        assert response.choices[0].message.content == "AUX_FLUSH_OK"
+        assert captured_kwargs["tools"][0]["name"] == "memory"
+        assert all(item["role"] != "tool" for item in captured_kwargs["input"])
+        converted_tool_items = [
+            item for item in captured_kwargs["input"]
+            if "Tool result" in str(item.get("content", ""))
+        ]
+        assert converted_tool_items
+        assert converted_tool_items[0]["role"] == "user"
 
 
 class TestVisionClientFallback:

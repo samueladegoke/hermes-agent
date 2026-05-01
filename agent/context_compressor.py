@@ -73,6 +73,30 @@ _IMAGE_TOKEN_ESTIMATE = 1600
 _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 
+DEFAULT_COMPRESSION_THRESHOLD = 0.85
+MIN_COMPRESSION_THRESHOLD = 0.50
+MAX_COMPRESSION_THRESHOLD = 0.95
+
+
+def normalize_compression_threshold(
+    value: Any,
+    *,
+    default: float = DEFAULT_COMPRESSION_THRESHOLD,
+) -> float:
+    """Return a safe compression threshold ratio.
+
+    Recommended target threshold was raised from 50% to 85% so compaction
+    happens closer to actual context exhaustion on large-window models. Invalid,
+    missing, or out-of-range values silently fall back to the safe default.
+    """
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not (MIN_COMPRESSION_THRESHOLD <= threshold <= MAX_COMPRESSION_THRESHOLD):
+        return default
+    return threshold
+
 
 def _content_length_for_budget(raw_content: Any) -> int:
     """Return the effective char-length of a message's content for token budgeting.
@@ -376,7 +400,7 @@ class ContextCompressor(ContextEngine):
     def __init__(
         self,
         model: str,
-        threshold_percent: float = 0.50,
+        threshold_percent: float = DEFAULT_COMPRESSION_THRESHOLD,
         protect_first_n: int = 3,
         protect_last_n: int = 20,
         summary_target_ratio: float = 0.20,
@@ -393,7 +417,7 @@ class ContextCompressor(ContextEngine):
         self.api_key = api_key
         self.provider = provider
         self.api_mode = api_mode
-        self.threshold_percent = threshold_percent
+        self.threshold_percent = normalize_compression_threshold(threshold_percent)
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
@@ -405,11 +429,11 @@ class ContextCompressor(ContextEngine):
             provider=provider,
         )
         # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even if
-        # the percentage would suggest a lower value.  This prevents premature
-        # compression on large-context models at 50% while keeping the % sane
-        # for models right at the minimum.
+        # the percentage would suggest a lower value. With the recommended 85%
+        # target, small contexts still keep a sane minimum while large-window
+        # models compact much later than the old 50% behavior.
         self.threshold_tokens = max(
-            int(self.context_length * threshold_percent),
+            int(self.context_length * self.threshold_percent),
             MINIMUM_CONTEXT_LENGTH,
         )
         self.compression_count = 0
@@ -427,7 +451,7 @@ class ContextCompressor(ContextEngine):
                 "threshold=%d (%.0f%%) target_ratio=%.0f%% tail_budget=%d "
                 "provider=%s base_url=%s",
                 model, self.context_length, self.threshold_tokens,
-                threshold_percent * 100, self.summary_target_ratio * 100,
+                self.threshold_percent * 100, self.summary_target_ratio * 100,
                 self.tail_token_budget,
                 provider or "none", base_url or "none",
             )
