@@ -119,6 +119,13 @@ class ResponsesApiTransport(ProviderTransport):
         request_overrides = params.get("request_overrides")
         if request_overrides:
             kwargs.update(request_overrides)
+        if is_codex_backend:
+            # chatgpt.com/backend-api/codex has a stricter Responses surface
+            # than api.openai.com: it rejects sampling/output cap overrides in
+            # side paths.  Strip overrides here so every Codex Responses caller
+            # gets the same permanent guard, not just flush_memories.
+            kwargs.pop("temperature", None)
+            kwargs.pop("max_output_tokens", None)
 
         if is_codex_backend:
             prompt_cache_key = kwargs.get("prompt_cache_key")

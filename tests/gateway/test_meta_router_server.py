@@ -135,4 +135,3 @@ def test_metrics_endpoint_exposes_counters_and_auth_state(monkeypatch):
     assert data["outcome_auth_configured"] is True
     assert data["limits"]["classify_body_bytes"] == server.MAX_CLASSIFY_BODY_BYTES
     assert "classify_total" in data["counters"]
-

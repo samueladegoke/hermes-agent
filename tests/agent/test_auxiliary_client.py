@@ -811,6 +811,92 @@ class TestAuxiliaryPoolAwareness:
         assert mock_resolve.call_count == 1
 
 
+
+class TestConsolidatedAuxiliaryMainBranchCoverage:
+    def test_tool_role_history_is_preserved_as_user_text(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        class _FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                return iter(())
+
+            def get_final_response(self):
+                return SimpleNamespace(output=[], usage=None)
+
+        class _FakeResponses:
+            def __init__(self):
+                self.kwargs = None
+
+            def stream(self, **kwargs):
+                self.kwargs = kwargs
+                return _FakeStream()
+
+        fake_client = SimpleNamespace(responses=_FakeResponses())
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.4")
+
+        adapter.create(
+            model="gpt-5.4",
+            messages=[
+                {"role": "system", "content": "system prompt"},
+                {"role": "assistant", "content": "checking"},
+                {"role": "tool", "tool_call_id": "call_1", "content": "tool output"},
+                {"role": "user", "content": "continue"},
+            ],
+        )
+
+        sent = fake_client.responses.kwargs
+        assert sent["instructions"] == "system prompt"
+        assert [m["role"] for m in sent["input"]] == ["assistant", "user", "user"]
+        assert "tool result" in sent["input"][1]["content"].lower()
+        assert "call_1" in sent["input"][1]["content"]
+        assert "tool output" in sent["input"][1]["content"]
+
+    def test_try_nous_prefers_runtime_credentials(self):
+        fresh_base = "https://inference-api.nousresearch.com/v1"
+        with (
+            patch("agent.auxiliary_client._read_nous_auth", return_value={"access_token": "stale-token"}),
+            patch("agent.auxiliary_client._resolve_nous_runtime_api", return_value=("fresh-agent-key", fresh_base)),
+            patch("hermes_cli.models.get_nous_recommended_aux_model", return_value=None),
+            patch("agent.auxiliary_client.OpenAI") as mock_openai,
+        ):
+            from agent.auxiliary_client import _try_nous
+
+            mock_openai.return_value = MagicMock()
+            client, model = _try_nous()
+
+        assert client is not None
+        assert model == "google/gemini-3-flash-preview"
+        assert mock_openai.call_args.kwargs["api_key"] == "fresh-agent-key"
+        assert mock_openai.call_args.kwargs["base_url"] == fresh_base
+
+    @pytest.mark.asyncio
+    async def test_async_call_llm_retries_explicit_provider_once_after_stream_disconnect(self):
+        client = MagicMock()
+        client.base_url = "https://chatgpt.com/backend-api/codex"
+        client.chat.completions.create = AsyncMock(side_effect=[
+            Exception("peer closed connection without sending complete message body (incomplete chunked read)"),
+            {"ok": True},
+        ])
+
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("openai-codex", "gpt-5.4", None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client", return_value=(client, "gpt-5.4")),
+            patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda resp, _task: resp),
+        ):
+            result = await async_call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        assert result == {"ok": True}
+        assert client.chat.completions.create.await_count == 2
+
 # ── Payment / credit exhaustion fallback ─────────────────────────────────
 
 

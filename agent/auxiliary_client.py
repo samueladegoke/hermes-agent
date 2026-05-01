@@ -475,6 +475,7 @@ class _CodexCompletionsAdapter:
         # API format (input_text / input_image instead of text / image_url).
         instructions = "You are a helpful assistant."
         input_msgs: List[Dict[str, Any]] = []
+        supported_input_roles = {"assistant", "developer", "system", "user"}
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content") or ""
@@ -482,17 +483,28 @@ class _CodexCompletionsAdapter:
                 instructions = content if isinstance(content, str) else str(content)
                 continue
 
-            # Chat Completions history can contain `tool` result messages, but
-            # the ChatGPT-backed Codex Responses endpoint only accepts
-            # assistant/system/developer/user input roles. Preserve the evidence
-            # as plain transcript text instead of forwarding an invalid role.
-            if role == "tool":
+            if role not in supported_input_roles:
+                # Chat Completions histories legitimately contain ``tool``
+                # messages, but the ChatGPT-backed Codex Responses endpoint
+                # rejects them in ``input`` (HTTP 400: supported roles are
+                # assistant/system/developer/user).  For auxiliary summarizers
+                # and memory flushes, preserve the information as user-visible
+                # transcript text instead of replaying a tool protocol turn.
+                if isinstance(content, str):
+                    content_text = content
+                else:
+                    try:
+                        content_text = json.dumps(content, ensure_ascii=False)
+                    except TypeError:
+                        content_text = str(content)
+                label_bits = ["Tool result"]
+                if msg.get("name") or msg.get("tool_name"):
+                    label_bits.append(str(msg.get("name") or msg.get("tool_name")))
+                if msg.get("tool_call_id"):
+                    label_bits.append(str(msg.get("tool_call_id")))
+                label = ": ".join(label_bits)
                 role = "user"
-                tool_id = msg.get("tool_call_id") or msg.get("tool_name") or "unknown"
-                content = f"[Tool result: {tool_id}]\n{content}"
-            elif role not in {"assistant", "developer", "user"}:
-                role = "user"
-
+                content = f"[{label}]\n{content_text}"
             input_msgs.append({
                 "role": role,
                 "content": _convert_content_for_responses(content),
@@ -1620,10 +1632,37 @@ def _is_connection_error(exc: Exception) -> bool:
     if any(kw in err_lower for kw in (
         "connection refused", "name or service not known",
         "no route to host", "network is unreachable",
-        "timed out", "connection reset",
+        "timed out", "connection reset", "server disconnected",
+        "peer closed connection", "connection was closed",
+        "incomplete chunked read", "unexpected eof",
+        "remote protocol",
     )):
         return True
     return False
+
+
+def _is_unsupported_parameter_error(exc: Exception, parameter: str = "") -> bool:
+    """Return True for provider 400s that reject a request parameter.
+
+    Several OpenAI-compatible gateways use different spellings for the same
+    contract failure, e.g. ``Unsupported parameter: temperature``,
+    ``unsupported_parameter`` or ``unsupported field``.  Keep this centralized
+    so auxiliary callers can retry with only the offending field removed rather
+    than mutating unrelated arguments.
+    """
+    err_lower = str(exc).lower()
+    if parameter and parameter.lower() not in err_lower:
+        return False
+    return any(
+        marker in err_lower
+        for marker in (
+            "unsupported parameter",
+            "unsupported_parameter",
+            "unsupported field",
+            "not support parameter",
+            "does not support parameter",
+        )
+    )
 
 
 def _is_auth_error(exc: Exception) -> bool:
@@ -2300,31 +2339,44 @@ def resolve_provider_client(
             final_model = _normalize_resolved_model(model or default_model, provider)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode else (client, final_model))
 
-        creds = resolve_api_key_provider_credentials(provider)
-        api_key = str(creds.get("api_key", "")).strip()
-        # Honour an explicit api_key override (e.g. from a fallback_model entry
-        # or a custom_providers entry) so callers that pass an explicit
-        # credential can authenticate against endpoints where no built-in
-        # credential is registered for this provider alias.
-        if explicit_api_key:
-            api_key = explicit_api_key.strip() or api_key
-        if not api_key:
-            tried_sources = list(pconfig.api_key_env_vars)
-            if provider == "copilot":
-                tried_sources.append("gh auth token")
-            logger.debug("resolve_provider_client: provider %s has no API "
-                         "key configured (tried: %s)",
-                         provider, ", ".join(tried_sources))
-            return None, None
+        pool_present, entry = _select_pool_entry(provider)
+        use_pool = pool_present and not (explicit_api_key or explicit_base_url)
+        if use_pool:
+            api_key = _pool_runtime_api_key(entry)
+            if not api_key:
+                logger.debug(
+                    "resolve_provider_client: provider %s credential pool has no usable runtime key",
+                    provider,
+                )
+                return None, None
+            base_url = _to_openai_base_url(
+                _pool_runtime_base_url(entry, pconfig.inference_base_url) or pconfig.inference_base_url
+            )
+        else:
+            creds = resolve_api_key_provider_credentials(provider)
+            api_key = str(creds.get("api_key", "")).strip()
+            # Honour an explicit api_key override (e.g. from a fallback_model entry
+            # or a custom_providers entry) so callers that pass an explicit
+            # credential can authenticate against endpoints where no built-in
+            # credential is registered for this provider alias.
+            if explicit_api_key:
+                api_key = explicit_api_key.strip() or api_key
+            if not api_key:
+                tried_sources = list(pconfig.api_key_env_vars)
+                if provider == "copilot":
+                    tried_sources.append("gh auth token")
+                logger.debug("resolve_provider_client: provider %s has no API "
+                             "key configured (tried: %s)",
+                             provider, ", ".join(tried_sources))
+                return None, None
 
-        raw_base_url = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
-        base_url = _to_openai_base_url(raw_base_url)
-        # Honour an explicit base_url override from the caller — used when a
-        # fallback_model entry (or custom_providers lookup) routes through a
-        # built-in provider name but targets a user-specified endpoint.
-        if explicit_base_url:
-            base_url = _to_openai_base_url(explicit_base_url.strip().rstrip("/"))
-
+            raw_base_url = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
+            base_url = _to_openai_base_url(raw_base_url)
+            # Honour an explicit base_url override from the caller - used when a
+            # fallback_model entry (or custom_providers lookup) routes through a
+            # built-in provider name but targets a user-specified endpoint.
+            if explicit_base_url:
+                base_url = _to_openai_base_url(explicit_base_url.strip().rstrip("/"))
         default_model = _API_KEY_PROVIDER_AUX_MODELS.get(provider, "")
         final_model = _normalize_resolved_model(model or default_model, provider)
 
@@ -3451,6 +3503,21 @@ def call_llm(
                 kwargs = retry_kwargs
 
         err_str = str(first_err)
+        err_str = str(first_err)
+        # Some newer Responses/OpenAI-compatible backends reject sampling
+        # parameters outright. If only temperature is unsupported, retry once
+        # with just that field removed; do not mutate max token semantics.
+        if _is_unsupported_parameter_error(first_err, "temperature") and "temperature" in kwargs:
+            kwargs.pop("temperature", None)
+            try:
+                return _validate_llm_response(
+                    client.chat.completions.create(**kwargs), task)
+            except Exception as retry_err:
+                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err)):
+                    raise
+                first_err = retry_err
+                err_str = str(first_err)
+
         if max_tokens is not None and (
             "max_tokens" in err_str
             or "unsupported_parameter" in err_str
@@ -3462,7 +3529,26 @@ def call_llm(
                 return _validate_llm_response(
                     client.chat.completions.create(**kwargs), task)
             except Exception as retry_err:
-                # If the max_tokens retry also hits a payment or connection
+                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err)):
+                    raise
+                first_err = retry_err
+                err_str = str(first_err)
+
+        err_lower = err_str.lower()
+
+        if (
+            "max_tokens" in err_lower
+            or "max_completion_tokens" in err_lower
+            or (_is_unsupported_parameter_error(first_err, "max_tokens") and "max_tokens" in kwargs)
+        ):
+            kwargs.pop("max_tokens", None)
+            if max_tokens is not None:
+                kwargs["max_completion_tokens"] = max_tokens
+            try:
+                return _validate_llm_response(
+                    client.chat.completions.create(**kwargs), task)
+            except Exception as retry_err:
+                # If the max-token retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
                 if not (_is_payment_error(retry_err) or _is_connection_error(retry_err)):
                     raise
@@ -3534,6 +3620,25 @@ def call_llm(
                         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
                     return _validate_llm_response(
                         retry_client.chat.completions.create(**retry_kwargs), task)
+
+        # ── Same-provider transient connection retry ──────────────────
+        # Streaming transports can fail mid-response (for example,
+        # "peer closed connection" / "incomplete chunked read").  Retry the
+        # resolved provider once before considering fallback or surfacing the
+        # error.  This applies even when the provider is explicitly configured,
+        # where fallback is intentionally disabled below.
+        if _is_connection_error(first_err):
+            logger.info(
+                "Auxiliary %s: connection error on %s (%s), retrying once",
+                task or "call", resolved_provider, first_err,
+            )
+            try:
+                return _validate_llm_response(
+                    client.chat.completions.create(**kwargs), task)
+            except Exception as retry_err:
+                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err)):
+                    raise
+                first_err = retry_err
 
         # ── Payment / credit exhaustion fallback ──────────────────────
         # When the resolved provider returns 402 or a credit-related error,
@@ -3743,6 +3848,21 @@ async def async_call_llm(
                 kwargs = retry_kwargs
 
         err_str = str(first_err)
+        err_str = str(first_err)
+        # Some newer Responses/OpenAI-compatible backends reject sampling
+        # parameters outright. If only temperature is unsupported, retry once
+        # with just that field removed; do not mutate max token semantics.
+        if _is_unsupported_parameter_error(first_err, "temperature") and "temperature" in kwargs:
+            kwargs.pop("temperature", None)
+            try:
+                return _validate_llm_response(
+                    await client.chat.completions.create(**kwargs), task)
+            except Exception as retry_err:
+                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err)):
+                    raise
+                first_err = retry_err
+                err_str = str(first_err)
+
         if max_tokens is not None and (
             "max_tokens" in err_str
             or "unsupported_parameter" in err_str
@@ -3754,7 +3874,26 @@ async def async_call_llm(
                 return _validate_llm_response(
                     await client.chat.completions.create(**kwargs), task)
             except Exception as retry_err:
-                # If the max_tokens retry also hits a payment or connection
+                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err)):
+                    raise
+                first_err = retry_err
+                err_str = str(first_err)
+
+        err_lower = err_str.lower()
+
+        if (
+            "max_tokens" in err_lower
+            or "max_completion_tokens" in err_lower
+            or (_is_unsupported_parameter_error(first_err, "max_tokens") and "max_tokens" in kwargs)
+        ):
+            kwargs.pop("max_tokens", None)
+            if max_tokens is not None:
+                kwargs["max_completion_tokens"] = max_tokens
+            try:
+                return _validate_llm_response(
+                    await client.chat.completions.create(**kwargs), task)
+            except Exception as retry_err:
+                # If the max-token retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
                 if not (_is_payment_error(retry_err) or _is_connection_error(retry_err)):
                     raise
@@ -3824,6 +3963,25 @@ async def async_call_llm(
                         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
                     return _validate_llm_response(
                         await retry_client.chat.completions.create(**retry_kwargs), task)
+
+        # ── Same-provider transient connection retry (mirrors sync) ────
+        # Streaming transports can fail mid-response (for example,
+        # "peer closed connection" / "incomplete chunked read").  Retry the
+        # resolved provider once before considering fallback or surfacing the
+        # error.  This applies even when the provider is explicitly configured,
+        # where fallback is intentionally disabled below.
+        if _is_connection_error(first_err):
+            logger.info(
+                "Auxiliary %s (async): connection error on %s (%s), retrying once",
+                task or "call", resolved_provider, first_err,
+            )
+            try:
+                return _validate_llm_response(
+                    await client.chat.completions.create(**kwargs), task)
+            except Exception as retry_err:
+                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err)):
+                    raise
+                first_err = retry_err
 
         # ── Payment / connection fallback (mirrors sync call_llm) ─────
         should_fallback = _is_payment_error(first_err) or _is_connection_error(first_err)
