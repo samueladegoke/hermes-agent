@@ -173,7 +173,36 @@ def test_windows_bridge_cli_probe_does_not_require_ssh_target():
     assert completed.returncode == 0, completed.stderr
     payload = json.loads(completed.stdout)
     assert "ssh_command" not in payload
+    assert payload["probe"]["ok"] is True
     assert payload["probe"]["BU_CDP_WS"] == f"ws://127.0.0.1:{server.server_port}/devtools/browser/test-browser"
+
+
+def test_windows_bridge_cli_probe_returns_json_error_when_endpoint_is_down():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        closed_port = sock.getsockname()[1]
+    script = Path(__file__).resolve().parents[2] / "scripts" / "browser_harness_windows_bridge.py"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--probe",
+            "--local-port",
+            str(closed_port),
+            "--json",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    payload = json.loads(completed.stdout)
+    assert payload["probe"]["ok"] is False
+    assert payload["probe"]["BU_CDP_WS"] is None
+    assert "Connection refused" in payload["probe"]["error"]
+    assert "Traceback" not in completed.stderr
 
 
 def test_ssh_bridge_canary_code_flushes_and_exits_after_success_markers():

@@ -103,11 +103,26 @@ def main(argv: list[str] | None = None) -> int:
             ],
         }
     if args.probe:
-        version_payload = fetch_cdp_version_payload(local_port=args.local_port)
-        payload["probe"] = {
-            "version_payload": version_payload,
-            "BU_CDP_WS": extract_cdp_websocket_url(version_payload, local_port=args.local_port),
-        }
+        try:
+            version_payload = fetch_cdp_version_payload(local_port=args.local_port)
+            payload["probe"] = {
+                "ok": True,
+                "error": "",
+                "version_payload": version_payload,
+                "BU_CDP_WS": extract_cdp_websocket_url(version_payload, local_port=args.local_port),
+            }
+        except Exception as exc:  # noqa: BLE001 - CLI should fail closed without traceback
+            payload["probe"] = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "version_payload": None,
+                "BU_CDP_WS": None,
+            }
+            if args.json:
+                print(json.dumps(payload, indent=2))
+            else:
+                sys.stdout.write(_render_text(payload))
+            return 1
     if args.json:
         print(json.dumps(payload, indent=2))
     else:

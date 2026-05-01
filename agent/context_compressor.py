@@ -50,11 +50,11 @@ SUMMARY_PREFIX = (
 LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 
 # Minimum tokens for the summary output
-_MIN_SUMMARY_TOKENS = 2000
+_MIN_SUMMARY_TOKENS = 600
 # Proportion of compressed content to allocate for summary
-_SUMMARY_RATIO = 0.20
+_SUMMARY_RATIO = 0.06
 # Absolute ceiling for summary tokens (even on very large context windows)
-_SUMMARY_TOKENS_CEILING = 12_000
+_SUMMARY_TOKENS_CEILING = 3_000
 
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
@@ -671,11 +671,11 @@ class ContextCompressor(ContextEngine):
     # Truncation limits for the summarizer input.  These bound how much of
     # each message the summary model sees — the budget is the *summary*
     # model's context window, not the main model's.
-    _CONTENT_MAX = 6000       # total chars per message body
-    _CONTENT_HEAD = 4000      # chars kept from the start
-    _CONTENT_TAIL = 1500      # chars kept from the end
-    _TOOL_ARGS_MAX = 1500     # tool call argument chars
-    _TOOL_ARGS_HEAD = 1200    # kept from the start of tool args
+    _CONTENT_MAX = 2500       # total chars per message body
+    _CONTENT_HEAD = 1600      # chars kept from the start
+    _CONTENT_TAIL = 650       # chars kept from the end
+    _TOOL_ARGS_MAX = 700      # tool call argument chars
+    _TOOL_ARGS_HEAD = 550     # kept from the start of tool args
 
     def _serialize_for_summary(self, turns: List[Dict[str, Any]]) -> str:
         """Serialize conversation turns into labeled text for the summarizer.
@@ -795,13 +795,7 @@ If no outstanding task exists, write "None."]
 [User preferences, coding style, constraints, important decisions]
 
 ## Completed Actions
-[Numbered list of concrete actions taken — include tool used, target, and outcome.
-Format each as: N. ACTION target — outcome [tool: name]
-Example:
-1. READ config.py:45 — found `==` should be `!=` [tool: read_file]
-2. PATCH config.py:45 — changed `==` to `!=` [tool: patch]
-3. TEST `pytest tests/` — 3/50 failed: test_parse, test_validate, test_edge [tool: terminal]
-Be specific with file paths, commands, line numbers, and results.]
+[Condensed milestone list, max 25 bullets. Group repetitive tool calls and searches; do NOT enumerate every tool call. Include exact commands/output only for the latest unresolved failure or final verification evidence.]
 
 ## Active State
 [Current working state — include:
@@ -827,7 +821,7 @@ Be specific with file paths, commands, line numbers, and results.]
 [Questions or requests from the user that have NOT yet been answered or fulfilled. If none, write "None."]
 
 ## Relevant Files
-[Files read, modified, or created — with brief note on each]
+[Max 25 files/directories that matter for the remaining task — with brief note on each. Omit files that were only read during broad exploration.]
 
 ## Remaining Work
 [What remains to be done — framed as context, not instructions]
@@ -835,7 +829,7 @@ Be specific with file paths, commands, line numbers, and results.]
 ## Critical Context
 [Any specific values, error messages, configuration details, or data that would be lost without explicit preservation. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]
 
-Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
+Hard cap ~{summary_budget} tokens. Be concise and concrete: keep file paths, final status, blocker names, and critical error messages, but do not paste raw tool outputs or long command transcripts unless they are essential to the active task. Prefer grouped evidence over exhaustive history.
 
 Write only the summary body. Do not include any preamble or prefix."""
 

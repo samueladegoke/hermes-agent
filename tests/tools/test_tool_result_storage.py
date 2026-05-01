@@ -512,7 +512,7 @@ class TestPerToolThresholds:
         try:
             import tools.terminal_tool  # noqa: F401
             val = registry.get_max_result_size("terminal")
-            assert val == 100_000
+            assert val == 50_000
         except ImportError:
             pytest.skip("terminal_tool not importable in test env")
 
@@ -530,6 +530,6 @@ class TestPerToolThresholds:
         try:
             import tools.file_tools  # noqa: F401
             val = registry.get_max_result_size("search_files")
-            assert val == 100_000
+            assert val == 20_000
         except ImportError:
             pytest.skip("file_tools not importable in test env")

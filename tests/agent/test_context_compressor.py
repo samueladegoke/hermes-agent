@@ -966,15 +966,15 @@ class TestSummaryTargetRatio:
         # 1M * 0.85 threshold * 0.40 ratio = 340K
         assert c.tail_token_budget == 340_000
 
-    def test_summary_cap_scales_with_context(self):
-        """Max summary tokens should be 5% of context, capped at 12K."""
+    def test_summary_cap_is_hard_bounded(self):
+        """Max summary tokens should stay bounded even on large-context models."""
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
             c = ContextCompressor(model="test", quiet_mode=True)
-        assert c.max_summary_tokens == 10_000  # 200K * 0.05
+        assert c.max_summary_tokens == 3_000
 
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             c = ContextCompressor(model="test", quiet_mode=True)
-        assert c.max_summary_tokens == 12_000  # capped at 12K ceiling
+        assert c.max_summary_tokens == 3_000
 
     def test_ratio_clamped(self):
         """Ratio should be clamped to [0.10, 0.80]."""
@@ -1435,3 +1435,27 @@ class TestTruncateToolCallArgsJson:
         parsed = _json.loads(shrunk)
         assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
         assert parsed["content"].endswith("...[truncated]")
+
+
+class TestContextLeakBudgets:
+    def test_summary_budget_is_bounded_for_large_contexts(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=1_050_000):
+            c = ContextCompressor(model="test/model", quiet_mode=True)
+        noisy_turns = [
+            {"role": "tool", "content": "x" * 50_000, "tool_call_id": f"call_{i}"}
+            for i in range(20)
+        ]
+        assert c._compute_summary_budget(noisy_turns) <= 3_000
+
+    def test_summary_prompt_discourages_exhaustive_tool_history(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "concise summary"
+        with patch("agent.context_compressor.get_model_context_length", return_value=1_050_000):
+            c = ContextCompressor(model="test/model", quiet_mode=True)
+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
+            c._generate_summary([{"role": "tool", "content": "x" * 10_000, "tool_call_id": "call_1"}])
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert "max 25 bullets" in prompt
+        assert "do NOT enumerate every tool call" in prompt
+        assert "do not paste raw tool outputs" in prompt

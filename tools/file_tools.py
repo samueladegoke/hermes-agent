@@ -79,10 +79,24 @@ _BLOCKED_DEVICE_PATHS = frozenset({
 
 
 def _resolve_path(filepath: str, task_id: str = "default") -> Path:
-    """Resolve a path relative to TERMINAL_CWD (the worktree base directory)
-    instead of the main repository root.
-    """
+    """Resolve a path relative to the active user-facing tool cwd."""
     return _resolve_path_for_task(filepath, task_id)
+
+
+def _preferred_tool_cwd(default_cwd: str | None = None) -> str:
+    """Prefer gateway/user-facing cwd over long-lived service cwd.
+
+    Gateway sessions can carry both MESSAGING_CWD and TERMINAL_CWD.  Relative
+    file paths should follow the chat/session cwd (MESSAGING_CWD) when present,
+    then fall back to TERMINAL_CWD, then the supplied/default process cwd.
+    """
+    messaging_cwd = (os.environ.get("MESSAGING_CWD") or "").strip()
+    if messaging_cwd:
+        return messaging_cwd
+    terminal_cwd = (os.environ.get("TERMINAL_CWD") or "").strip()
+    if terminal_cwd:
+        return terminal_cwd
+    return default_cwd or os.getcwd()
 
 
 def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
@@ -120,9 +134,7 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
     """Resolve *filepath* against the task's live terminal cwd when possible."""
     p = Path(filepath).expanduser()
     if not p.is_absolute():
-        base = _get_live_tracking_cwd(task_id) or os.environ.get(
-            "TERMINAL_CWD", os.getcwd()
-        )
+        base = _get_live_tracking_cwd(task_id) or _preferred_tool_cwd()
         p = Path(base) / p
     return p.resolve()
 
@@ -1120,6 +1132,6 @@ def _handle_search_files(args, **kw):
 
 
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=float('inf'))
-registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
-registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
-registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)
+registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=50_000)
+registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=50_000)
+registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=20_000)

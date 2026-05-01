@@ -72,3 +72,67 @@ def test_classify_returns_original_text_when_bypassed(monkeypatch):
     assert data["bypass_reason"] == "short-ack"
     assert data["directive"] == ""
     assert data["text_with_directive"] == "ok"
+
+def test_outcome_endpoint_logs_terminal_outcome(monkeypatch):
+    captured = {}
+
+    monkeypatch.setenv("META_ROUTER_OUTCOME_TOKEN", "test-token")
+    monkeypatch.setattr(
+        server,
+        "run_outcome_only",
+        lambda **kwargs: captured.update(kwargs),
+    )
+    client = TestClient(server.app)
+
+    resp = client.post(
+        "/outcome",
+        headers={"Authorization": "Bearer test-token"},
+        json={
+            "request_id": "rid-openclaw-fail",
+            "task_type": "config",
+            "session_id": "sess-openclaw",
+            "source": "openclaw-plugin",
+            "surface": "openclaw",
+            "routing_artifact_version": "candidate-0010",
+            "success": False,
+            "error": "pairing required",
+            "duration_ms": 3250,
+            "notes": ["phase=plugin-agent-end"],
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    assert captured["request_id"] == "rid-openclaw-fail"
+    assert captured["task_type"] == "config"
+    assert captured["session_id"] == "sess-openclaw"
+    assert captured["source"] == "openclaw-plugin"
+    assert captured["surface"] == "openclaw"
+    assert captured["routing_artifact_version"] == "candidate-0010"
+    assert captured["error"] == "pairing required"
+    assert captured["notes_extra"] == ["phase=plugin-agent-end", "success=false"]
+
+
+def test_outcome_endpoint_rejects_missing_bearer_token(monkeypatch):
+    monkeypatch.setenv("META_ROUTER_OUTCOME_TOKEN", "test-token")
+    client = TestClient(server.app)
+
+    resp = client.post("/outcome", json={"request_id": "rid", "task_type": "code"})
+
+    assert resp.status_code == 401
+    assert resp.json()["detail"] == "missing bearer token"
+
+
+def test_metrics_endpoint_exposes_counters_and_auth_state(monkeypatch):
+    monkeypatch.setenv("META_ROUTER_OUTCOME_TOKEN", "test-token")
+    client = TestClient(server.app)
+
+    resp = client.get("/metrics")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["outcome_auth_configured"] is True
+    assert data["limits"]["classify_body_bytes"] == server.MAX_CLASSIFY_BODY_BYTES
+    assert "classify_total" in data["counters"]
+

@@ -37,6 +37,8 @@ _MR_DIR = Path("/home/samade10/.openclaw/workspace/skills/maintainer/meta-router
 _EXP_DIR = _MR_DIR / "experience"
 _SCRIPTS_DIR = _MR_DIR / "scripts"
 _LOG_WRITER_PATH = _EXP_DIR / "log_writer.py"
+_HYGIENE_PATH = _SCRIPTS_DIR / "experience_hygiene.py"
+_EVENTS_JSONL = _EXP_DIR / "routing_events.jsonl"
 _OUTCOMES_JSONL = _EXP_DIR / "routing_outcomes.jsonl"
 _RUNNER_PATH = _SCRIPTS_DIR / "mr_als_runner.py"
 
@@ -51,6 +53,9 @@ _ADV_TASK_TYPES = {"code", "audit", "production", "integration"}
 # ── Log writer lazy-init ───────────────────────────────────────────────────────
 _lw_mod = None
 _lw_lock = threading.Lock()
+_hygiene_mod = None
+_hygiene_lock = threading.Lock()
+_last_optimizer_trigger_eligible_count: Optional[int] = None
 
 
 def _load_log_writer():
@@ -72,6 +77,27 @@ def _load_log_writer():
         except Exception:
             pass
     return _lw_mod
+
+
+def _load_experience_hygiene():
+    global _hygiene_mod
+    if _hygiene_mod is not None:
+        return _hygiene_mod
+    with _hygiene_lock:
+        if _hygiene_mod is not None:
+            return _hygiene_mod
+        if not _HYGIENE_PATH.exists():
+            return None
+        try:
+            spec = importlib.util.spec_from_file_location("_mr_experience_hygiene", _HYGIENE_PATH)
+            if spec is None or spec.loader is None:
+                return None
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _hygiene_mod = mod
+        except Exception:
+            pass
+    return _hygiene_mod
 
 
 # ── MR type → SoM type map ─────────────────────────────────────────────────────
@@ -458,30 +484,17 @@ def format_routed_response(raw_response: str, phase2: Phase2Result, directive: s
         pieces.extend(receipt_lines)
         return "\n".join(p for p in pieces if p is not None)
 
-    score_threshold_failure = (
+    threshold_only_failure = (
         phase2.delivery_gate_passed is False
-        and phase2.score is not None
-        and phase2.threshold is not None
-        and phase2.score < phase2.threshold
         and phase2.oracle_verdict == "PASS"
         and phase2.adv_pass_clean is not False
         and not phase2.error
     )
-    delivery_gate_rejection = (
-        phase2.delivery_gate_passed is False
-        and phase2.score is not None
-        and phase2.threshold is not None
-        and phase2.score >= phase2.threshold
-        and phase2.oracle_verdict == "PASS"
-        and phase2.adv_pass_clean is not False
-        and not phase2.error
+    lead = (
+        "Backend evaluation blocked final delivery: the draft passed Oracle and ADV_PASS, but missed the final score threshold."
+        if threshold_only_failure
+        else "Backend evaluation failed. The draft output did not satisfy the routed SoM/EOP gates."
     )
-    if score_threshold_failure:
-        lead = "Backend evaluation blocked final delivery: the draft passed Oracle and ADV_PASS, but missed the final score threshold."
-    elif delivery_gate_rejection:
-        lead = "Backend evaluation blocked final delivery: the draft passed the score threshold, Oracle, and ADV_PASS, but a downstream delivery gate rejected it."
-    else:
-        lead = "Backend evaluation failed. The draft output did not satisfy the routed SoM/EOP gates."
 
     lines = [lead, "", "[META-ROUTER RECEIPT]"]
     lines.extend(receipt_lines)
@@ -731,6 +744,17 @@ def _count_outcomes() -> int:
         return 0
 
 
+def _count_eligible_outcomes() -> int:
+    hygiene = _load_experience_hygiene()
+    if hygiene is None:
+        return 0
+    try:
+        records = hygiene.load_joined_records(_EVENTS_JSONL, _OUTCOMES_JSONL)
+    except Exception:
+        return 0
+    return sum(1 for record in records if record.get("eligible_for_learning"))
+
+
 def _trigger_optimizer_bg() -> None:
     """Launch mr_als_runner.py --phase 4,5 --force in a background subprocess."""
     if not _RUNNER_PATH.exists():
@@ -751,9 +775,11 @@ def _trigger_optimizer_bg() -> None:
 
 
 def _maybe_trigger_optimizer() -> None:
+    global _last_optimizer_trigger_eligible_count
     try:
-        n = _count_outcomes()
-        if n >= 10 and n % 10 == 0:
+        n = _count_eligible_outcomes()
+        if n >= 10 and n % 10 == 0 and n != _last_optimizer_trigger_eligible_count:
+            _last_optimizer_trigger_eligible_count = n
             _trigger_optimizer_bg()
     except Exception:
         pass
@@ -823,6 +849,8 @@ def run_phase2(
     t0: float,
     routing_artifact_version: str = "static-default",
     session_id: Optional[str] = None,
+    source: Optional[str] = None,
+    surface: Optional[str] = None,
 ) -> Phase2Result:
     """Run SoM completion + outcome logging synchronously."""
     return _do_phase2(
@@ -834,6 +862,8 @@ def run_phase2(
         t0,
         routing_artifact_version,
         session_id,
+        source,
+        surface,
     )
 
 
@@ -846,6 +876,8 @@ def run_phase2_async(
     t0: float,
     routing_artifact_version: str = "static-default",
     session_id: Optional[str] = None,
+    source: Optional[str] = None,
+    surface: Optional[str] = None,
 ) -> None:
     """Run SoM completion + outcome logging in a background daemon thread."""
 
@@ -859,6 +891,8 @@ def run_phase2_async(
             t0,
             routing_artifact_version,
             session_id,
+            source,
+            surface,
         )
 
     t = threading.Thread(target=_worker, daemon=True, name=f"mr-p2-{request_id[:8]}")
@@ -874,6 +908,8 @@ def _do_phase2(
     t0: float,
     routing_artifact_version: str,
     session_id: Optional[str],
+    source: Optional[str] = None,
+    surface: Optional[str] = None,
 ) -> Phase2Result:
     """Inner blocking implementation of Phase 2."""
     latency_ms = round((time.time() - t0) * 1000, 1)
@@ -1097,6 +1133,9 @@ def _do_phase2(
             lw.log_routing_outcome(
                 request_id=request_id,
                 task_type=task_type,
+                session_id=session_id,
+                source=source,
+                surface=surface,
                 composite_score=composite_score,
                 som_score=som_score,
                 eop_score=eop_score,
@@ -1133,6 +1172,10 @@ def run_outcome_only(
     t0: float,
     routing_artifact_version: str = "static-default",
     session_id: Optional[str] = None,
+    source: Optional[str] = None,
+    surface: Optional[str] = None,
+    error: Optional[str] = None,
+    notes_extra: Optional[list[str]] = None,
 ) -> None:
     """Log an outcome when SoM phase 1/2 was skipped."""
     latency_ms = round((time.time() - t0) * 1000, 1)
@@ -1142,9 +1185,13 @@ def run_outcome_only(
             notes = [f"artifact={routing_artifact_version}", "phase=outcome-only"]
             if session_id:
                 notes.append(f"session={session_id}")
+            notes.extend(list(notes_extra or []))
             lw.log_routing_outcome(
                 request_id=request_id,
                 task_type=task_type,
+                session_id=session_id,
+                source=source,
+                surface=surface,
                 composite_score=50.0,
                 som_score=None,
                 eop_score=None,
@@ -1152,7 +1199,7 @@ def run_outcome_only(
                 outcome_quality=None,
                 adv_pass_clean=None,
                 latency_ms=latency_ms,
-                error=None,
+                error=error,
                 notes=" | ".join(notes),
             )
         except Exception:

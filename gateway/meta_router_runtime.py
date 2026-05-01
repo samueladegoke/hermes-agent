@@ -18,6 +18,8 @@ import re
 import sys
 import uuid
 from dataclasses import dataclass
+
+from gateway.meta_router_memory import build_memory_plan, format_memory_plan_block
 from pathlib import Path
 from typing import Optional
 
@@ -60,6 +62,8 @@ def get_bypass_reason(text: str) -> str:
 
     if not trimmed:
         return "empty"
+    if "This session is about to be automatically reset due to inactivity or a scheduled daily reset" in trimmed:
+        return "internal-reset-flush"
     if re.fullmatch(r"/\S+", trimmed):
         return "command"
     if trimmed[:1] in {"!", "#"}:
@@ -109,20 +113,58 @@ class RouteDecision:
     routing_artifact_version: str = "static-default"
     bypassed: bool = False
     bypass_reason: str = ""
+    memory_need: str = "auto"
+    memory_authority: list[str] | None = None
+    required_tools: list[str] | None = None
+    optional_tools: list[str] | None = None
+    skip_tools: list[str] | None = None
+    max_memory_steps: int = 0
+    memory_policy_version: str = "mr-memory-v1"
+
+    @property
+    def prepend_text(self) -> str:
+        if self.bypassed or not self.directive:
+            return ""
+        from gateway.meta_router_memory import MemoryPlan
+
+        block = format_memory_plan_block(MemoryPlan(
+            need=self.memory_need,
+            authority=list(self.memory_authority or []),
+            required_tools=list(self.required_tools or []),
+            optional_tools=list(self.optional_tools or []),
+            skip_tools=list(self.skip_tools or []),
+            max_memory_steps=self.max_memory_steps,
+            policy_version=self.memory_policy_version,
+            rationale="",
+        ))
+        return f"{self.directive}\n\n{block}" if block else self.directive
 
 
 # ── Artifact-aware weighted classifier ────────────────────────────────────────
 
 def _classify_with_overrides(text: str, overrides: dict, _RULES, _MODE_RULES) -> tuple[str, str, float]:
     """
-    Apply artifact keyword_weight_adjustments + type_priority to a raw classify.
-    Returns (task_type, mode, confidence).
-    Falls back to "code" / 0.5 when all scores are zero.
+    Apply artifact keyword_weight_adjustments + type_priority to classification.
+
+    The adaptive artifact is allowed to reorder or weight positive evidence. It
+    is *not* allowed to manufacture a confident coding route when no keyword hit
+    exists, or when the artifact's own min-confidence gate says the result is too
+    weak. Those cases return confidence=0.0, matching the static classifier's
+    fail-closed posture, so downstream gates can treat the route as uncertain
+    instead of silently executing as code at confidence 0.5.
     """
     weight_adj = overrides.get("keyword_weight_adjustments", {})
     type_priority = overrides.get("type_priority", [])
     min_conf = overrides.get("confidence_thresholds", {}).get("min_confidence_to_route", 0.0)
     lower = text.lower()
+
+    def _infer_mode() -> str:
+        for m, patterns in _MODE_RULES[:-1]:
+            if any(re.search(p, lower) for p in patterns):
+                return m
+        return "execute"
+
+    mode = _infer_mode()
 
     # Raw keyword scores
     raw: dict[str, int] = {cat: 0 for cat, _ in _RULES}
@@ -146,23 +188,14 @@ def _classify_with_overrides(text: str, overrides: dict, _RULES, _MODE_RULES) ->
     best_score = adjusted.get(best_type, 0.0)
 
     if best_score <= 0:
-        best_type = "code"
-        confidence = 0.5
-    else:
-        total = sum(adjusted.values()) or 1.0
-        confidence = round(best_score / total, 3)
+        return "code", mode, 0.0
 
-    # Confidence threshold gate
+    total = sum(adjusted.values()) or 1.0
+    confidence = round(best_score / total, 3)
+
+    # Confidence threshold gate: fail closed, do not rewrite to code/0.5.
     if confidence < min_conf:
-        best_type = "code"
-        confidence = 0.5
-
-    # Mode inference
-    mode = "execute"
-    for m, patterns in _MODE_RULES[:-1]:
-        if any(re.search(p, lower) for p in patterns):
-            mode = m
-            break
+        return best_type, mode, 0.0
 
     return best_type, mode, confidence
 
@@ -197,6 +230,7 @@ def make_route_decision(
 
     bypass_reason = get_bypass_reason(text)
     if bypass_reason:
+        _memory_plan = build_memory_plan(text, "code", "execute", bypassed=True)
         decision = RouteDecision(
             request_id=rid,
             type="code",
@@ -209,6 +243,13 @@ def make_route_decision(
             routing_artifact_version=_artifact_version,
             bypassed=True,
             bypass_reason=bypass_reason,
+            memory_need=_memory_plan.need,
+            memory_authority=list(_memory_plan.authority),
+            required_tools=list(_memory_plan.required_tools),
+            optional_tools=list(_memory_plan.optional_tools),
+            skip_tools=list(_memory_plan.skip_tools),
+            max_memory_steps=_memory_plan.max_memory_steps,
+            memory_policy_version=_memory_plan.policy_version,
         )
     else:
         # Classify — with artifact overrides when an artifact is active,
@@ -228,6 +269,7 @@ def make_route_decision(
                 confidence = result.confidence
                 directive = result.directive
 
+            _memory_plan = build_memory_plan(text, task_type, mode)
             decision = RouteDecision(
                 request_id=rid,
                 type=task_type,
@@ -238,8 +280,16 @@ def make_route_decision(
                 secondary=_SECONDARY.get(task_type),
                 budget_multiplier=_BUDGET.get(task_type, 1.0),
                 routing_artifact_version=_artifact_version,
+                memory_need=_memory_plan.need,
+                memory_authority=list(_memory_plan.authority),
+                required_tools=list(_memory_plan.required_tools),
+                optional_tools=list(_memory_plan.optional_tools),
+                skip_tools=list(_memory_plan.skip_tools),
+                max_memory_steps=_memory_plan.max_memory_steps,
+                memory_policy_version=_memory_plan.policy_version,
             )
         except Exception as e:
+            _memory_plan = build_memory_plan(text, "research", "execute")
             decision = RouteDecision(
                 request_id=rid,
                 type="research",
@@ -252,6 +302,13 @@ def make_route_decision(
                 routing_artifact_version=_artifact_version,
                 bypassed=True,
                 bypass_reason=f"classify failed: {e}",
+                memory_need=_memory_plan.need,
+                memory_authority=list(_memory_plan.authority),
+                required_tools=list(_memory_plan.required_tools),
+                optional_tools=list(_memory_plan.optional_tools),
+                skip_tools=list(_memory_plan.skip_tools),
+                max_memory_steps=_memory_plan.max_memory_steps,
+                memory_policy_version=_memory_plan.policy_version,
             )
 
     # Log routing event (non-blocking, never raises)
@@ -270,6 +327,13 @@ def make_route_decision(
                 request_id=rid,
                 routing_artifact_version=_artifact_version,
                 active_candidate_id=_artifact_version,
+                memory_need=decision.memory_need,
+                memory_authority=list(decision.memory_authority or []),
+                required_tools=list(decision.required_tools or []),
+                optional_tools=list(decision.optional_tools or []),
+                skip_tools=list(decision.skip_tools or []),
+                max_memory_steps=decision.max_memory_steps,
+                memory_policy_version=decision.memory_policy_version,
             )
         except Exception:
             pass

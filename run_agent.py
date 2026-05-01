@@ -189,6 +189,47 @@ from utils import atomic_json_write, base_url_host_matches, base_url_hostname, e
 from hermes_cli.config import cfg_get
 
 
+_META_ROUTER_DIRECTIVE_RE = re.compile(r"^\[META-ROUTER\s*\|\s*([^|\]]+)\s*\|\s*([^\]]+)\]")
+
+# Review-mode turns should stay read-only. Keep the model-facing tool surface
+# investigative so routed reviews cannot silently mutate files, processes,
+# external services, memory, or account state.
+_REVIEW_SAFE_TOOL_NAMES = frozenset({
+    "read_file",
+    "search_files",
+    "session_search",
+    "skills_list",
+    "skill_view",
+    "web_search",
+    "web_extract",
+    "vision_analyze",
+    "browser_navigate",
+    "browser_snapshot",
+    "browser_get_images",
+    "browser_scroll",
+    "browser_back",
+    "browser_vision",
+    "mcp_qmd_query",
+    "mcp_qmd_get",
+    "mcp_qmd_multi_get",
+    "mcp_qmd_hot_query",
+    "mcp_qmd_hot_get",
+    "mcp_qmd_hot_multi_get",
+    "mcp_open_brain_recall",
+})
+
+
+def _parse_meta_router_directive(text: str | None) -> tuple[str | None, str | None, str | None]:
+    """Return (directive, type, mode) when text begins with a MR directive."""
+    if not isinstance(text, str):
+        return None, None, None
+    match = _META_ROUTER_DIRECTIVE_RE.match(text.strip())
+    if not match:
+        return None, None, None
+    task_type = match.group(1).strip().lower() or None
+    mode = match.group(2).strip().lower() or None
+    return match.group(0), task_type, mode
+
 
 def _resolve_compression_threshold(compression_cfg) -> float:
     """Resolve compression.threshold safely.
@@ -1580,11 +1621,13 @@ class AIAgent:
             disabled_toolsets=disabled_toolsets,
             quiet_mode=self.quiet_mode,
         )
+        self._base_tools = list(self.tools or [])
         
         # Show tool configuration and store valid tool names for validation
         self.valid_tool_names = set()
         if self.tools:
             self.valid_tool_names = {tool["function"]["name"] for tool in self.tools}
+            self._base_valid_tool_names = set(self.valid_tool_names)
             tool_names = sorted(self.valid_tool_names)
             if not self.quiet_mode:
                 print(f"🛠️  Loaded {len(self.tools)} tools: {', '.join(tool_names)}")
@@ -1595,6 +1638,7 @@ class AIAgent:
                 if disabled_toolsets:
                     print(f"   ❌ Disabled toolsets: {', '.join(disabled_toolsets)}")
         elif not self.quiet_mode:
+            self._base_valid_tool_names = set()
             print("🛠️  No tools loaded (all tools filtered out or unavailable)")
         
         # Check tool requirements
@@ -10360,6 +10404,23 @@ class AIAgent:
 
         return final_response
 
+    def _reset_turn_tools(self) -> None:
+        self.tools = list(getattr(self, "_base_tools", []) or [])
+        self.valid_tool_names = set(getattr(self, "_base_valid_tool_names", set()) or set())
+
+    def _apply_turn_tool_policy(self) -> None:
+        self._reset_turn_tools()
+        if str(getattr(self, "_mr_mode", "") or "").strip().lower() != "review":
+            return
+        filtered_tools = []
+        filtered_names = set()
+        for tool in self.tools or []:
+            name = tool.get("function", {}).get("name") if isinstance(tool, dict) else None
+            if name in _REVIEW_SAFE_TOOL_NAMES:
+                filtered_tools.append(tool)
+                filtered_names.add(name)
+        self.tools = filtered_tools
+        self.valid_tool_names = filtered_names
     def _omx_executor_enabled(self) -> bool:
         env_value = str(os.getenv("HERMES_ENABLE_OMX_EXECUTOR", "")).strip().lower()
         if env_value:
@@ -10391,6 +10452,8 @@ class AIAgent:
             return False
         if getattr(self, "_mr_task_type", None) != "code":
             return False
+        if str(getattr(self, "_mr_mode", "") or "").strip().lower() != "execute":
+            return False
         return bool(
             getattr(self, "_mr_request_id", None)
             and getattr(self, "_mr_som_state_dir", None)
@@ -10412,7 +10475,7 @@ class AIAgent:
         request = build_execution_request(
             request_id=str(getattr(self, "_mr_request_id", "") or ""),
             task_type=str(getattr(self, "_mr_task_type", "code") or "code"),
-            mode="execute",
+            mode=str(getattr(self, "_mr_mode", "execute") or "execute"),
             directive=str(getattr(self, "_mr_directive", "") or ""),
             routing_artifact_version=str(getattr(self, "_mr_routing_artifact_version", "static-default") or "static-default"),
             session_id=getattr(self, "session_id", None),
@@ -10421,10 +10484,15 @@ class AIAgent:
             task_text=task_text,
             context_brief_path=getattr(self, "_mr_context_brief_path", None),
         )
+        _mr_platform = getattr(self, "platform", None) or "cli"
+        handoff_workdir = (
+            (os.getenv("MESSAGING_CWD") or os.getenv("TERMINAL_CWD"))
+            if _mr_platform != "cli"
+            else (os.getenv("TERMINAL_CWD") or os.getenv("MESSAGING_CWD"))
+        ) or os.getcwd()
         exec_result = execute_request(
             request,
-            workdir=os.getenv("TERMINAL_CWD") or os.getcwd(),
-            command_override=self._omx_command_override(),
+            workdir=handoff_workdir,            command_override=self._omx_command_override(),
         )
         output_path = Path(str(exec_result.get("output_path") or request["output_path"]))
         if output_path.exists():
@@ -10491,18 +10559,16 @@ class AIAgent:
         # saveMessages persists a turn that included injected context, the block
         # can reappear in the next turn's user message via message history.
         # Stripping here prevents stale memory tags from leaking into the
-        # conversation and being visible to the user or the model as user text.
-        if isinstance(user_message, str):
+        # conversation and being visible to the user or the model as user text.        if isinstance(user_message, str):
             user_message = sanitize_context(user_message)
         if isinstance(persist_user_message, str):
             persist_user_message = sanitize_context(persist_user_message)
 
         # meta-router: pre-classify Hermes turns with the shared MR-ALS runtime.
         # Direct classify (no HTTP) + RouteDecision + event logging + SoM Phase 1.
-        # Gateway surfaces should flow through this same path; do not pre-inject
-        # directives in platform adapters.
         self._mr_request_id = None
         self._mr_task_type = None
+        self._mr_mode = None
         self._mr_start_time = None
         self._mr_som_state_dir = None
         self._mr_original_task = None
@@ -10512,7 +10578,15 @@ class AIAgent:
         self._mr_context_brief_path = None
         _mr_platform = getattr(self, "platform", None) or "cli"
         _mr_source = "cli" if _mr_platform == "cli" else "gateway"
-        if user_message and not user_message.startswith("[META-ROUTER |"):
+        _prefixed_directive, _prefixed_type, _prefixed_mode = _parse_meta_router_directive(user_message)
+        if _prefixed_directive:
+            self._mr_directive = _prefixed_directive
+            self._mr_task_type = _prefixed_type
+            self._mr_mode = _prefixed_mode
+            self._mr_original_task = user_message
+            if persist_user_message is None:
+                persist_user_message = user_message
+        elif isinstance(user_message, str) and user_message:
             try:
                 import time as _mr_time
                 _mr_t0 = _mr_time.time()
@@ -10523,18 +10597,20 @@ class AIAgent:
                     surface=_mr_platform,
                     session_id=getattr(self, "session_id", None),
                 )
+                _mr_prepend = getattr(_mr_dec, "prepend_text", None) or _mr_dec.directive
                 _mr_original = user_message
                 if persist_user_message is None:
                     persist_user_message = _mr_original
-                if not _mr_dec.bypassed and _mr_dec.directive:
-                    user_message = f"{_mr_dec.directive}\n{user_message}"
+                if not _mr_dec.bypassed and _mr_prepend:
+                    user_message = f"{_mr_prepend}\n{user_message}"
                     self._mr_request_id = _mr_dec.request_id
                     self._mr_task_type = _mr_dec.type
+                    self._mr_mode = getattr(_mr_dec, "mode", None)
                     self._mr_start_time = _mr_t0
                     self._mr_original_task = _mr_original
                     self._mr_routing_artifact_version = getattr(_mr_dec, "routing_artifact_version", None)
                     self._mr_directive = _mr_dec.directive
-                    # Phase 1: generate SoM targets (fast, rule-based — no LLM)
+                    # Phase 1: generate SoM targets (fast, rule-based — no LLM).
                     if len(_mr_original) >= 40 and _mr_dec.confidence >= 0.35:
                         try:
                             from gateway.meta_router_executor import run_phase1 as _mr_p1
@@ -10561,21 +10637,21 @@ class AIAgent:
                                 if _mr_ctx_brief:
                                     self._mr_context_brief_path = str(Path(_prep.state_dir) / "context_brief.json")
                                     user_message = (
-                                        f"{_mr_dec.directive}\n\n"
-                                        f"{_prep.targets_context}\n\n"
+                                        f"{_mr_prepend}\n\n"                                        f"{_prep.targets_context}\n\n"
                                         f"[CONTEXT BRIEF]\n{_mr_ctx_brief}\n\n"
                                         f"{_mr_original}"
                                     )
                                 else:
                                     user_message = (
-                                        f"{_mr_dec.directive}\n\n"
-                                        f"{_prep.targets_context}\n\n"
+                                        f"{_mr_prepend}\n\n"                                        f"{_prep.targets_context}\n\n"
                                         f"{_mr_original}"
                                     )
                         except Exception:
                             pass  # Phase 1 failure is non-fatal
             except Exception:
                 pass  # meta-router runtime unavailable — proceed without directive
+
+        self._apply_turn_tool_policy()
         # Store stream callback for _interruptible_api_call to pick up
         self._stream_callback = stream_callback
         self._persist_user_message_idx = None
@@ -13890,6 +13966,165 @@ class AIAgent:
 
         # Persist session to both JSON log and SQLite
         self._persist_session(messages, conversation_history)
+
+        # MR-ALS post-turn: SoM Phase 2 scoring + outcome logging + receipt formatting.
+        # Reentrancy guard: when a correction pass re-enters run_conversation, the outer
+        # call still owns phase2 evaluation — inner calls must return their draft verbatim.
+        _mr_rid = getattr(self, "_mr_request_id", None)
+        _mr_in_correction = getattr(self, "_mr_in_correction", False)
+        if _mr_rid and not _mr_in_correction:
+            try:
+                from gateway.meta_router_executor import (
+                    format_routed_response as _mr_fmt,
+                    run_phase2 as _mr_p2,
+                    run_outcome_only as _mr_out_only,
+                )
+                _mr_sdir = getattr(self, "_mr_som_state_dir", None)
+                _mr_tt = getattr(self, "_mr_task_type", None) or "research"
+                _mr_t0 = getattr(self, "_mr_start_time", None) or 0.0
+                _mr_otask = getattr(self, "_mr_original_task", None) or ""
+                _mr_art = getattr(self, "_mr_routing_artifact_version", None) or "static-default"
+                _mr_sid = getattr(self, "session_id", None)
+                _mr_directive = getattr(self, "_mr_directive", None) or ""
+                _mr_platform = getattr(self, "platform", None) or "cli"
+                _mr_source = "cli" if _mr_platform == "cli" else "gateway"
+                _mr_effective_empty = (
+                    not final_response
+                    or not str(final_response).strip()
+                    or str(final_response).strip() == "(empty)"
+                )
+                if _mr_effective_empty:
+                    _mr_out_only(
+                        request_id=_mr_rid,
+                        task_type=_mr_tt,
+                        t0=_mr_t0,
+                        routing_artifact_version=_mr_art,
+                        session_id=_mr_sid,
+                        source=_mr_source,
+                        surface=_mr_platform,
+                        error="missing-final-response",
+                        notes_extra=["phase=missing-final-response"],
+                    )
+                    final_response = ""
+                elif _mr_sdir and _mr_otask:
+                    _MR_MAX_FIX_PASSES = 2
+                    _mr_fix_pass = 0
+                    _mr_phase2 = _mr_p2(
+                        _mr_rid, _mr_tt, _mr_otask, _mr_sdir,
+                        final_response, _mr_t0, _mr_art, _mr_sid, _mr_source, _mr_platform,
+                    )
+                    while (
+                        not _mr_phase2.passed
+                        and _mr_fix_pass < _MR_MAX_FIX_PASSES
+                        and _mr_phase2.fix_prompt_path
+                    ):
+                        _mr_fix_pass += 1
+                        try:
+                            from pathlib import Path as _MRPath
+                            _fix_instructions = _MRPath(_mr_phase2.fix_prompt_path).read_text(encoding="utf-8")
+                            _score_str = f"{_mr_phase2.score:.0f}" if _mr_phase2.score is not None else "?"
+                            _thresh_str = f"{_mr_phase2.threshold:.0f}" if _mr_phase2.threshold is not None else "?"
+                            _fix_prefix = (
+                                f"CORRECTION PASS {_mr_fix_pass}/{_MR_MAX_FIX_PASSES} — "
+                                f"Score was {_score_str}/{_thresh_str}, revision needed before delivery.\n\n"
+                                f"{_fix_instructions}\n\n"
+                                f"Revise and restate your complete response below."
+                            )
+                            _fix_response = ""
+                            _use_omx_correction = (
+                                _mr_tt == "code"
+                                and self._omx_executor_enabled()
+                                and getattr(self, "_mr_som_state_dir", None)
+                            )
+                            if _use_omx_correction:
+                                _fix_response, _fix_exec_result = self._run_omx_handoff(
+                                    correction_task_text=_fix_prefix,
+                                )
+                                if not _fix_response:
+                                    raise RuntimeError(
+                                        f"OMX correction pass produced no output: {_fix_exec_result}"
+                                    )
+                            else:
+                                self._mr_in_correction = True
+                                try:
+                                    _fix_result = self.run_conversation(
+                                        user_message=_fix_prefix,
+                                        conversation_history=list(messages),
+                                        persist_user_message="[MR correction pass — not user-visible]",
+                                    )
+                                finally:
+                                    self._mr_in_correction = False
+                                _fix_response = (_fix_result.get("final_response") or "").strip()
+                            if _fix_response:
+                                final_response = _fix_response
+                                try:
+                                    (_MRPath(_mr_sdir) / "output.md").write_text(final_response, encoding="utf-8")
+                                except Exception:
+                                    pass
+                                _mr_phase2 = _mr_p2(
+                                    _mr_rid, _mr_tt, _mr_otask, _mr_sdir,
+                                    final_response, _mr_t0, _mr_art, _mr_sid, _mr_source, _mr_platform,
+                                )
+                        except Exception as _mr_fix_exc:
+                            import logging as _mr_logging
+                            _mr_logging.getLogger("meta_router").warning(
+                                "MR correction pass %d failed: %s", _mr_fix_pass, _mr_fix_exc
+                            )
+                            break
+                    final_response = _mr_fmt(final_response, _mr_phase2, directive=_mr_directive)
+                    for _mr_msg in reversed(messages):
+                        if _mr_msg.get("role") == "assistant":
+                            _mr_msg["content"] = final_response
+                            break
+                else:
+                    _mr_out_only(
+                        request_id=_mr_rid,
+                        task_type=_mr_tt,
+                        t0=_mr_t0,
+                        routing_artifact_version=_mr_art,
+                        session_id=_mr_sid,
+                        source=_mr_source,
+                        surface=_mr_platform,
+                    )
+            except Exception as _mr_p2_exc:
+                import logging as _mr_logging
+                _mr_logging.getLogger("meta_router").warning(
+                    "MR phase2 block failed: %s", _mr_p2_exc
+                )
+                try:
+                    from gateway.meta_router_executor import run_outcome_only as _mr_out_only_fallback
+                    _mr_platform = getattr(self, "platform", None) or "cli"
+                    _mr_source = "cli" if _mr_platform == "cli" else "gateway"
+                    _mr_out_only_fallback(
+                        request_id=_mr_rid,
+                        task_type=getattr(self, "_mr_task_type", None) or "research",
+                        t0=getattr(self, "_mr_start_time", None) or 0.0,
+                        routing_artifact_version=getattr(self, "_mr_routing_artifact_version", None) or "static-default",
+                        session_id=getattr(self, "session_id", None),
+                        source=_mr_source,
+                        surface=_mr_platform,
+                        error="phase2-block-exception",
+                        notes_extra=[
+                            "phase=phase2-exception",
+                            f"phase2_exception={str(_mr_p2_exc)[:160]}",
+                        ],
+                    )
+                except Exception:
+                    pass
+            finally:
+                self._reset_turn_tools()
+                self._mr_request_id = None
+                self._mr_som_state_dir = None
+                self._mr_task_type = None
+                self._mr_mode = None
+                self._mr_start_time = None
+                self._mr_original_task = None
+                self._mr_routing_artifact_version = None
+                self._mr_directive = None
+                self._mr_targets_context = None
+                self._mr_context_brief_path = None
+        else:
+            self._reset_turn_tools()
 
         # ── Turn-exit diagnostic log ─────────────────────────────────────
         # Always logged at INFO so agent.log captures WHY every turn ended.

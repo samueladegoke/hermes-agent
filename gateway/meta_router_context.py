@@ -96,6 +96,8 @@ def gather_pre_execution_context(
     task_text: str,
     task_type: str,
     state_dir: Optional[Path],
+    memory_need: Optional[str] = None,
+    required_tools: Optional[list[str]] = None,
 ) -> Optional[str]:
     """
     Run context_gatherer.py before Hermes executes the task.
@@ -110,7 +112,9 @@ def gather_pre_execution_context(
         state_dir:  SoM state directory (used as output dir for context_brief.json).
                     If None, gathering is skipped.
     """
-    if task_type not in _CONTEXT_TYPES:
+    required = set(required_tools or [])
+    needs_retrieval = bool(required.intersection({"memory_search", "qmd__query"})) or (memory_need in {"history", "docs", "history+docs", "wiki+history"})
+    if task_type not in _CONTEXT_TYPES and not needs_retrieval:
         return None
     if not _CONTEXT_GATHERER.exists():
         return None
