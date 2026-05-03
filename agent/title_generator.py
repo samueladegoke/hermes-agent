@@ -24,6 +24,12 @@ _TITLE_PROMPT = (
     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
 )
 
+# Title generation is a non-primary helper task.  Keep its output budget tiny
+# so low-credit providers (for example OpenRouter accounts with only a few
+# hundred tokens affordable) can still succeed, and so a credit/provider
+# failure only skips the title instead of affecting the main bot response.
+_TITLE_MAX_TOKENS = 96
+
 
 def generate_title(
     user_message: str,
@@ -56,7 +62,7 @@ def generate_title(
         response = call_llm(
             task="title_generation",
             messages=messages,
-            max_tokens=500,
+            max_tokens=_TITLE_MAX_TOKENS,
             temperature=0.3,
             timeout=timeout,
             main_runtime=main_runtime,

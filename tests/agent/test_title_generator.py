@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.title_generator import (
+    _TITLE_MAX_TOKENS,
     generate_title,
     auto_title_session,
     maybe_auto_title,
@@ -112,6 +113,24 @@ class TestGenerateTitle:
         # The user content in the messages should be truncated
         user_content = captured_kwargs["messages"][1]["content"]
         assert len(user_content) < 1100  # 500 + 500 + formatting
+
+    def test_uses_small_output_budget_for_low_credit_auxiliary_provider(self):
+        """Title generation should not request 500 tokens from low-credit helper providers."""
+        captured_kwargs = {}
+
+        def mock_call_llm(**kwargs):
+            captured_kwargs.update(kwargs)
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = "Meme Coin Bot Check"
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            title = generate_title("check the meme-coin bot", "I found an auxiliary issue")
+
+        assert title == "Meme Coin Bot Check"
+        assert captured_kwargs["max_tokens"] == _TITLE_MAX_TOKENS
+        assert captured_kwargs["max_tokens"] <= 128
 
 
 class TestAutoTitleSession:
