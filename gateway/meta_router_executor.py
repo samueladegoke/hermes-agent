@@ -484,17 +484,37 @@ def format_routed_response(raw_response: str, phase2: Phase2Result, directive: s
         pieces.extend(receipt_lines)
         return "\n".join(p for p in pieces if p is not None)
 
+    score_below_threshold = (
+        phase2.score is not None
+        and phase2.threshold is not None
+        and phase2.score < phase2.threshold
+    )
     threshold_only_failure = (
         phase2.delivery_gate_passed is False
         and phase2.oracle_verdict == "PASS"
         and phase2.adv_pass_clean is not False
         and not phase2.error
+        and score_below_threshold
     )
-    lead = (
-        "Backend evaluation blocked final delivery: the draft passed Oracle and ADV_PASS, but missed the final score threshold."
-        if threshold_only_failure
-        else "Backend evaluation failed. The draft output did not satisfy the routed SoM/EOP gates."
+    delivery_gate_only_failure = (
+        phase2.delivery_gate_passed is False
+        and phase2.oracle_verdict == "PASS"
+        and phase2.adv_pass_clean is not False
+        and not phase2.error
+        and not score_below_threshold
     )
+    if threshold_only_failure:
+        lead = (
+            "Backend evaluation blocked final delivery: the draft passed Oracle and ADV_PASS, "
+            "but missed the final score threshold."
+        )
+    elif delivery_gate_only_failure:
+        lead = (
+            "Backend evaluation blocked final delivery: the draft met the score threshold, "
+            "but a downstream delivery gate rejected it."
+        )
+    else:
+        lead = "Backend evaluation failed. The draft output did not satisfy the routed SoM/EOP gates."
 
     lines = [lead, "", "[META-ROUTER RECEIPT]"]
     lines.extend(receipt_lines)
