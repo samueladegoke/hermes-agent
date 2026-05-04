@@ -259,6 +259,38 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
 # Add new patterns here when a model family needs explicit steering.
 TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok")
 
+
+def build_active_tool_availability_prompt(available_tools) -> str:
+    """Return a compact, explicit inventory of tools active in this session.
+
+    The API tool schema is the authority for what can be called, but some
+    models occasionally infer a narrower capability set from recent tool use or
+    stale conversation context. Injecting the active names into the prompt gives
+    the model a local self-check before it claims that a tool is unavailable.
+    """
+    names = sorted({str(name) for name in (available_tools or []) if str(name).strip()})
+    if not names:
+        return ""
+    prompt = (
+        "# Active tool availability\n"
+        "The following tool names are active in this session's tool schema: "
+        + ", ".join(names)
+        + ".\n"
+        "Do not claim a tool is unavailable if its name appears in this active tool list. "
+        "If unsure, inspect this active tool list first; tool availability varies by "
+        "platform, enabled toolsets, disabled toolsets, MCP health, and delegated/cron "
+        "session restrictions."
+    )
+    if "vision_analyze" in names:
+        prompt += (
+            "\nVision input rule: call vision_analyze only with an HTTP/HTTPS image URL "
+            "or an existing local image file path that came from the user or a prior "
+            "tool result. Do not invent, guess, or fuzz image paths such as "
+            "`/tmp/nonexistent`; if no image source is available, ask for one or use "
+            "an appropriate browser/image-capture tool first."
+        )
+    return prompt
+
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
 # hallucinate instead of using tools, and declare "done" without verification.
