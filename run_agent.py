@@ -3574,6 +3574,82 @@ class AIAgent:
     )
 
     @staticmethod
+    def _clean_background_review_history(messages: List[Dict]) -> List[Dict]:
+        """Return a review-safe conversation history without prior tool payloads.
+
+        The self-improvement fork only needs the user's request, the assistant's
+        final-visible text, and signals such as loaded skills mentioned in normal
+        text. Raw tool messages can be huge, provider-specific, or misleading
+        stale action records; they also make the fork inherit orphaned tool-call
+        sequences after we remove tool results. Keep a clean, API-valid transcript
+        by dropping role=tool messages and stripping assistant tool_calls.
+        """
+        cleaned: List[Dict] = []
+        for msg in messages or []:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            if role == "tool":
+                continue
+            if role not in {"system", "user", "assistant"}:
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict) and isinstance(block.get("text"), str):
+                        text_parts.append(block["text"])
+                content = "\n".join(text_parts)
+            if content is None:
+                content = ""
+            if not isinstance(content, str):
+                content = str(content)
+            if role == "assistant" and not content.strip():
+                # Assistant messages that only requested tools are meaningless
+                # once tool calls/results are excluded, and can violate provider
+                # validation if replayed with no content.
+                continue
+            cleaned.append({"role": role, "content": content})
+        return cleaned
+
+    def _build_background_review_prompt(
+        self=None,
+        review_memory: bool = False,
+        review_skills: bool = False,
+    ) -> Optional[str]:
+        """Choose the class-first self-improvement prompt for this review pass.
+
+        This helper intentionally supports both instance calls and historical
+        class-style test calls like ``AIAgent._build_background_review_prompt(False, True)``.
+        """
+        if isinstance(self, bool):
+            # Called on the class without an instance; shift positional flags.
+            review_memory, review_skills = self, review_memory
+            prompt_owner = AIAgent
+        else:
+            prompt_owner = self or AIAgent
+
+        memory_prompt = getattr(prompt_owner, "_MEMORY_REVIEW_PROMPT")
+        skill_prompt = getattr(prompt_owner, "_SKILL_REVIEW_PROMPT")
+        combined_prompt = getattr(prompt_owner, "_COMBINED_REVIEW_PROMPT")
+        skill_rule = getattr(prompt_owner, "_SKILL_REVIEW_DECISION_RULE", "")
+
+        if review_memory and review_skills:
+            return combined_prompt
+        if review_memory:
+            return memory_prompt
+        if review_skills:
+            return f"{skill_rule}\n\n{skill_prompt}" if skill_rule else skill_prompt
+        return None
+
+    @staticmethod
+    def _collect_background_review_actions(
+        review_messages: List[Dict],
+    ) -> List[str]:
+        """Collect successful background-review actions from fresh tool output."""
+        return AIAgent._summarize_background_review_actions(review_messages, [])
+
+    @staticmethod
     def _summarize_background_review_actions(
         review_messages: List[Dict],
         prior_snapshot: List[Dict],
@@ -3651,15 +3727,15 @@ class AIAgent:
         """
         import threading
 
-        history = list(messages_snapshot or [])
-        if len(history) == 0:
-            return
+        history = self._clean_background_review_history(messages_snapshot or [])
 
         prompt = self._build_background_review_prompt(
             review_memory=review_memory,
             review_skills=review_skills,
         )
         if prompt is None:
+            return
+        if len(history) == 0 and not review_memory:
             return
 
         def _run_review():

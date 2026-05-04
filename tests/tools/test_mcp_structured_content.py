@@ -18,6 +18,25 @@ class _FakeContentBlock:
         self.type = block_type
 
 
+class _FakeResourceBlock:
+    """Minimal MCP embedded-resource content block.
+
+    QMD's get tool returns document text as a resource block rather than as
+    top-level TextContent. Hermes must extract resource.text so successful
+    retrievals do not appear as empty results.
+    """
+
+    def __init__(self, text: str, uri: str = "qmd://memory.md"):
+        self.type = "resource"
+        self.resource = SimpleNamespace(
+            uri=uri,
+            name="memory.md",
+            title="memory.md",
+            mimeType="text/markdown",
+            text=text,
+        )
+
+
 class _FakeCallToolResult:
     """Minimal CallToolResult stand-in.
 
@@ -140,3 +159,30 @@ class TestStructuredContentPreservation:
         raw = handler({})
         data = json.loads(raw)
         assert data["result"] == payload
+
+    def test_embedded_resource_text_is_extracted(self, _patch_mcp_server):
+        """Resource content blocks should expose resource.text to the agent."""
+        session = _patch_mcp_server
+        document_text = "1: VM facts: rg is on PATH.\n2: Hermes config is ~/.hermes/config.yaml"
+        session.call_tool = AsyncMock(
+            return_value=_FakeCallToolResult(
+                content=[_FakeResourceBlock(document_text)],
+            )
+        )
+        handler = mcp_tool._make_tool_handler("test-server", "qmd-get", 30.0)
+        raw = handler({})
+        data = json.loads(raw)
+        assert data == {"result": document_text}
+
+    def test_mixed_text_and_resource_blocks_are_joined(self, _patch_mcp_server):
+        """Multiple visible content block forms are preserved in order."""
+        session = _patch_mcp_server
+        session.call_tool = AsyncMock(
+            return_value=_FakeCallToolResult(
+                content=[_FakeContentBlock("prefix"), _FakeResourceBlock("body")],
+            )
+        )
+        handler = mcp_tool._make_tool_handler("test-server", "mixed-tool", 30.0)
+        raw = handler({})
+        data = json.loads(raw)
+        assert data == {"result": "prefix\nbody"}

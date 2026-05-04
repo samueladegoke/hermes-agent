@@ -129,6 +129,30 @@ def test_background_review_installs_auto_deny_approval_callback(monkeypatch):
     )
 
 
+def test_background_review_history_excludes_prior_tool_messages():
+    """The review fork should see clean conversation text, not raw tool payloads."""
+    messages = [
+        {"role": "user", "content": "Please inspect the repo."},
+        {
+            "role": "assistant",
+            "content": "I'll check it.",
+            "tool_calls": [{"id": "tc1", "function": {"name": "terminal", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "tc1", "content": "very large terminal output"},
+        {"role": "assistant", "content": "Done: issue found."},
+    ]
+
+    cleaned = AIAgent._clean_background_review_history(messages)
+
+    assert cleaned == [
+        {"role": "user", "content": "Please inspect the repo."},
+        {"role": "assistant", "content": "I'll check it."},
+        {"role": "assistant", "content": "Done: issue found."},
+    ]
+    assert all("tool_calls" not in msg for msg in cleaned)
+    assert all(msg["role"] != "tool" for msg in cleaned)
+
+
 def test_background_review_summary_is_attributed_to_self_improvement_loop(monkeypatch):
     """The CLI/gateway emission must identify the self-improvement loop.
 

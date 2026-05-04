@@ -301,6 +301,37 @@ def _sanitize_error(text: str) -> str:
     return _CREDENTIAL_PATTERN.sub("[REDACTED]", text)
 
 
+def _extract_mcp_content_text(content_blocks: List[Any]) -> str:
+    """Return model-visible text from MCP content blocks.
+
+    Most MCP tools return top-level TextContent blocks with a ``text`` field.
+    Some compliant tools return embedded resource blocks instead, represented
+    by the Python SDK as objects like ``{type: "resource", resource: {text}}``.
+    Include both forms so successful resource-returning tools do not look empty
+    to the agent. Non-text/binary resources are deliberately ignored.
+    """
+    parts: List[str] = []
+    for block in content_blocks or []:
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+            continue
+
+        resource = getattr(block, "resource", None)
+        if resource is None and isinstance(block, dict):
+            resource = block.get("resource")
+        if resource is None:
+            continue
+
+        resource_text = getattr(resource, "text", None)
+        if resource_text is None and isinstance(resource, dict):
+            resource_text = resource.get("text")
+        if isinstance(resource_text, str):
+            parts.append(resource_text)
+
+    return "\n".join(parts) if parts else ""
+
+
 # ---------------------------------------------------------------------------
 # MCP tool description content scanning
 # ---------------------------------------------------------------------------
@@ -2015,22 +2046,20 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 result = await server.session.call_tool(tool_name, arguments=args)
             # MCP CallToolResult has .content (list of content blocks) and .isError
             if result.isError:
-                error_text = ""
-                for block in (result.content or []):
-                    if hasattr(block, "text"):
-                        error_text += block.text
+                error_text = _extract_mcp_content_text(result.content or [])
                 return json.dumps({
                     "error": _sanitize_error(
                         error_text or "MCP tool returned an error"
                     )
                 }, ensure_ascii=False)
 
-            # Collect text from content blocks
-            parts: List[str] = []
-            for block in (result.content or []):
-                if hasattr(block, "text"):
-                    parts.append(block.text)
-            text_result = "\n".join(parts) if parts else ""
+            # Collect model-visible text from content blocks. Some servers
+            # (notably QMD's get tool) return embedded resources instead of
+            # top-level TextContent blocks: {type: "resource", resource: {text}}.
+            # The MCP SDK exposes those as objects with .resource.text, so a
+            # text-only extraction silently returned an empty result even though
+            # the tool had successfully retrieved the document.
+            text_result = _extract_mcp_content_text(result.content or [])
 
             # Combine content + structuredContent when both are present.
             # MCP spec: content is model-oriented (text), structuredContent
