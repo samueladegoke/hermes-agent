@@ -417,7 +417,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         thread_id = target.get("thread_id")
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
-        origin = job.get("origin") or {}
+        origin = _resolve_origin(job) or {}
         origin_thread = origin.get("thread_id")
         if origin_thread and not thread_id:
             logger.warning(
@@ -782,6 +782,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         return prompt
 
     from tools.skills_tool import skill_view
+    from tools.skill_usage import bump_use
 
     parts = []
     skipped: list[str] = []
@@ -792,6 +793,12 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             logger.warning("Cron job '%s': skill not found, skipping — %s", job.get("name", job.get("id")), error)
             skipped.append(skill_name)
             continue
+
+        # Bump usage so the curator sees this skill as actively used.
+        try:
+            bump_use(skill_name)
+        except Exception:
+            logger.debug("Cron job: failed to bump skill usage for '%s'", skill_name, exc_info=True)
 
         content = str(loaded.get("content") or "").strip()
         if parts:

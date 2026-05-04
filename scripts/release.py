@@ -67,6 +67,8 @@ AUTHOR_MAP = {
     "nbot@liizfq.top": "liizfq",
     "274096618+hermes-agent-dhabibi@users.noreply.github.com": "dhabibi",
     "dejie.guo@gmail.com": "JayGwod",
+    "133716830+0xKingBack@users.noreply.github.com": "0xKingBack",
+    "daixin1204@gmail.com": "SimbaKingjoe",
     "maxence@groine.fr": "MaxyMoos",
     "61830395+leprincep35700@users.noreply.github.com": "leprincep35700",
     # OpenViking viking_read salvage (April 2026)
@@ -621,6 +623,33 @@ AUTHOR_MAP = {
     "2114364329@qq.com": "cuyua9",
     "2557058999@qq.com": "Disaster-Terminator",
     "cine.dreamer.one@gmail.com": "LeonSGP43",
+    "zyprothh@gmail.com": "Zyproth",
+    "amitgaur@gmail.com": "amitgaur",
+    "albuquerque.abner@gmail.com": "mrbob-git",
+    "kiala@users.noreply.github.com": "kiala9",
+    "alanxchen@gmail.com": "alanxchen85",
+    "clawbot@clawbots-Mac-mini.local": "John-tip",
+    "der@konsi.org": "konsisumer",
+    "cirwel@The-CIRWEL-Group.local": "CIRWEL",
+    "molvikar8@gmail.com": "molvikar",
+    "nftpoetrist@gmail.com": "nftpoetrist",
+    "dodofun@126.com": "colorcross",
+    "1615063567@qq.com": "zhao0112",
+    "ethanguo.2003@gmail.com": "EthanGuo-coder",
+    "dev0jsh@gmail.com": "tmdgusya",
+    "leavr@163.com": "leavrcn",
+    "17683456+wanazhar@users.noreply.github.com": "wanazhar",
+    "26782336+cixuuz@users.noreply.github.com": "cixuuz",
+    "aleksandr.pasevin@openzeppelin.com": "pasevin",
+    "ubuntu@localhost.localdomain": "holynn-q",
+    "holynn@placeholder.local": "holynn-q",
+    "agent@hermes.local": "jacdevos",
+    "sunsky.lau@gmail.com": "liuhao1024",
+    "qiuqfang98@qq.com": "keepcalmqqf",
+    "261867348+ai-ag2026@users.noreply.github.com": "ai-ag2026",
+    "yanzh.su@gmail.com": "YanzhongSu",
+    "wanderwang@users.noreply.github.com": "WanderWang",
+    "yueheime@gmail.com": "yuehei",
     "leozeli@qq.com": "leozeli",
     "linlehao@cuhk.edu.cn": "LehaoLin",
     "liutong@isacas.ac.cn": "I3eg1nner",
@@ -679,6 +708,8 @@ AUTHOR_MAP = {
     "ztzheng@163.com": "chengoak",  # PR #17467
     "24110240104@m.fudan.edu.cn": "YuShu",  # co-author only
     "charliekerfoot@gmail.com": "CharlieKerfoot",  # PR #18951
+    # Debug share upload-time redaction (May 2026)
+    "dhuysamen@gmail.com": "GodsBoy",  # PR #19318
 }
 
 
