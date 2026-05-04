@@ -9409,16 +9409,20 @@ class AIAgent:
                             old_text=args.get("old_text"),
                             store=self._memory_store,
                         )
-                        if self._memory_manager and args.get("action") in ("add", "replace"):
+                        if self._memory_manager and args.get("action") in ("add", "replace", "remove"):
                             try:
+                                _old_text = args.get("old_text")
+                                _metadata = self._build_memory_write_metadata(
+                                    write_origin="memory_flush",
+                                    execution_context="flush_memories",
+                                )
+                                if _old_text:
+                                    _metadata["old_text"] = _old_text
                                 self._memory_manager.on_memory_write(
                                     args.get("action", ""),
                                     flush_target,
-                                    args.get("content", ""),
-                                    metadata=self._build_memory_write_metadata(
-                                        write_origin="memory_flush",
-                                        execution_context="flush_memories",
-                                    ),
+                                    args.get("content") or _old_text or "",
+                                    metadata=_metadata,
                                 )
                             except Exception:
                                 pass
@@ -9742,16 +9746,20 @@ class AIAgent:
                 store=self._memory_store,
             )
             # Bridge: notify external memory provider of built-in memory writes
-            if self._memory_manager and function_args.get("action") in ("add", "replace"):
+            if self._memory_manager and function_args.get("action") in ("add", "replace", "remove"):
                 try:
+                    _old_text = function_args.get("old_text")
+                    _metadata = self._build_memory_write_metadata(
+                        task_id=effective_task_id,
+                        tool_call_id=tool_call_id,
+                    )
+                    if _old_text:
+                        _metadata["old_text"] = _old_text
                     self._memory_manager.on_memory_write(
                         function_args.get("action", ""),
                         target,
-                        function_args.get("content", ""),
-                        metadata=self._build_memory_write_metadata(
-                            task_id=effective_task_id,
-                            tool_call_id=tool_call_id,
-                        ),
+                        function_args.get("content") or _old_text or "",
+                        metadata=_metadata,
                     )
                 except Exception:
                     pass
@@ -10346,16 +10354,20 @@ class AIAgent:
                     store=self._memory_store,
                 )
                 # Bridge: notify external memory provider of built-in memory writes
-                if self._memory_manager and function_args.get("action") in ("add", "replace"):
+                if self._memory_manager and function_args.get("action") in ("add", "replace", "remove"):
                     try:
+                        _old_text = function_args.get("old_text")
+                        _metadata = self._build_memory_write_metadata(
+                            task_id=effective_task_id,
+                            tool_call_id=getattr(tool_call, "id", None),
+                        )
+                        if _old_text:
+                            _metadata["old_text"] = _old_text
                         self._memory_manager.on_memory_write(
                             function_args.get("action", ""),
                             target,
-                            function_args.get("content", ""),
-                            metadata=self._build_memory_write_metadata(
-                                task_id=effective_task_id,
-                                tool_call_id=getattr(tool_call, "id", None),
-                            ),
+                            function_args.get("content") or _old_text or "",
+                            metadata=_metadata,
                         )
                     except Exception:
                         pass

@@ -31,6 +31,28 @@ from hermes_cli.config import cfg_get
 logger = logging.getLogger(__name__)
 
 
+def _category_for_builtin_target(target: str) -> str:
+    """Map built-in memory targets to holographic fact categories."""
+    return "user_pref" if target == "user" else "general"
+
+
+def _validate_fact_content(content: str) -> str | None:
+    """Return an error string if *content* is unsafe for durable memory.
+
+    Holographic facts can be injected into future prompts through prefetch(), so
+    explicit fact_store writes need the same prompt-injection/exfiltration guard
+    as built-in MEMORY.md / USER.md entries.
+    """
+    if not isinstance(content, str) or not content.strip():
+        return "content must not be empty"
+    try:
+        from tools.memory_tool import _scan_memory_content
+        return _scan_memory_content(content)
+    except Exception as exc:
+        logger.debug("Holographic content scanner unavailable: %s", exc)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Tool schemas (unchanged from original PR)
 # ---------------------------------------------------------------------------
@@ -241,14 +263,68 @@ class HolographicMemoryProvider(MemoryProvider):
             return
         self._auto_extract_facts(messages)
 
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
-        """Mirror built-in memory writes as facts."""
-        if action == "add" and self._store and content:
-            try:
-                category = "user_pref" if target == "user" else "general"
+    def on_memory_write(
+        self,
+        action: str,
+        target: str,
+        content: str,
+        metadata: Dict[str, Any] | None = None,
+    ) -> None:
+        """Mirror built-in memory writes as facts.
+
+        Built-in memory is the authoritative curated store. This hook keeps the
+        local structured fact store aligned when MEMORY.md / USER.md entries are
+        added, replaced, or removed.
+        """
+        if not self._store:
+            return
+
+        metadata = metadata or {}
+        category = _category_for_builtin_target(target)
+
+        try:
+            if action == "add":
+                scan_error = _validate_fact_content(content)
+                if scan_error:
+                    logger.debug("Holographic memory_write add rejected: %s", scan_error)
+                    return
                 self._store.add_fact(content, category=category)
-            except Exception as e:
-                logger.debug("Holographic memory_write mirror failed: %s", e)
+            elif action == "replace":
+                old_text = str(metadata.get("old_text") or "").strip()
+                if old_text:
+                    self._remove_matching_facts(old_text)
+                scan_error = _validate_fact_content(content)
+                if scan_error:
+                    logger.debug("Holographic memory_write replace rejected: %s", scan_error)
+                    return
+                self._store.add_fact(content, category=category)
+            elif action == "remove":
+                old_text = str(metadata.get("old_text") or content or "").strip()
+                if old_text:
+                    self._remove_matching_facts(old_text)
+        except Exception as e:
+            logger.debug("Holographic memory_write mirror failed: %s", e)
+
+    def _remove_matching_facts(self, old_text: str, category: str | None = None) -> int:
+        """Remove facts whose content matches a built-in memory old_text key."""
+        if not self._store or not old_text:
+            return 0
+        conn = self._store._conn
+        if category:
+            rows = conn.execute(
+                "SELECT fact_id, content FROM facts WHERE category = ?",
+                (category,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT fact_id, content FROM facts").fetchall()
+
+        removed = 0
+        for row in rows:
+            fact_content = row["content"]
+            if fact_content == old_text or old_text in fact_content:
+                if self._store.remove_fact(int(row["fact_id"])):
+                    removed += 1
+        return removed
 
     def shutdown(self) -> None:
         self._store = None
@@ -263,8 +339,12 @@ class HolographicMemoryProvider(MemoryProvider):
             retriever = self._retriever
 
             if action == "add":
+                content = args["content"]
+                scan_error = _validate_fact_content(content)
+                if scan_error:
+                    return tool_error(scan_error)
                 fact_id = store.add_fact(
-                    args["content"],
+                    content,
                     category=args.get("category", "general"),
                     tags=args.get("tags", ""),
                 )
@@ -314,6 +394,10 @@ class HolographicMemoryProvider(MemoryProvider):
                 return json.dumps({"results": results, "count": len(results)})
 
             elif action == "update":
+                if args.get("content") is not None:
+                    scan_error = _validate_fact_content(args["content"])
+                    if scan_error:
+                        return tool_error(scan_error)
                 updated = store.update_fact(
                     int(args["fact_id"]),
                     content=args.get("content"),
@@ -378,7 +462,9 @@ class HolographicMemoryProvider(MemoryProvider):
             for pattern in _PREF_PATTERNS:
                 if pattern.search(content):
                     try:
-                        self._store.add_fact(content[:400], category="user_pref")
+                        fact_content = content[:400]
+                        if not _validate_fact_content(fact_content):
+                            self._store.add_fact(fact_content, category="user_pref")
                         extracted += 1
                     except Exception:
                         pass
@@ -387,7 +473,9 @@ class HolographicMemoryProvider(MemoryProvider):
             for pattern in _DECISION_PATTERNS:
                 if pattern.search(content):
                     try:
-                        self._store.add_fact(content[:400], category="project")
+                        fact_content = content[:400]
+                        if not _validate_fact_content(fact_content):
+                            self._store.add_fact(fact_content, category="project")
                         extracted += 1
                     except Exception:
                         pass
