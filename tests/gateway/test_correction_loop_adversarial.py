@@ -878,19 +878,10 @@ def test_phase2_keeps_delivery_gate_pass_when_oracle_is_skipped(tmp_path, monkey
 # ----------------------------------------------------------------------------
 
 def _resolve_max_fix_passes(task_type, env=None):
-    """Mirrors the resolver in run_agent.py so the logic can be unit-tested."""
-    import os
-    env = env if env is not None else os.environ
-    defaults = {
-        "code": 3, "integration": 3, "production": 3,
-        "audit": 2, "research": 2, "design": 2, "config": 2,
-    }
-    raw = env.get(f"HERMES_MR_MAX_FIX_PASSES_{task_type.upper()}") or env.get("HERMES_MR_MAX_FIX_PASSES")
-    try:
-        value = int(raw) if raw else defaults.get(task_type, 2)
-    except ValueError:
-        value = defaults.get(task_type, 2)
-    return max(0, value)
+    """Exercise the production resolver rather than a local mirror."""
+    from run_agent import _resolve_mr_max_fix_passes
+
+    return _resolve_mr_max_fix_passes(task_type, env=env)
 
 
 @pytest.mark.parametrize("task_type,expected", [
@@ -942,6 +933,16 @@ def test_dynamic_fix_passes_negative_env_clamped_to_zero():
     """Negative values clamp to 0 (disables retries entirely)."""
     env = {"HERMES_MR_MAX_FIX_PASSES": "-5"}
     assert _resolve_max_fix_passes("code", env=env) == 0
+
+
+def test_run_conversation_uses_dynamic_mr_max_fix_passes():
+    """Production correction loop must use the env-aware resolver, not a hardcoded cap."""
+    import run_agent
+
+    source = Path(run_agent.__file__).read_text(encoding="utf-8")
+
+    assert "_MR_MAX_FIX_PASSES = _resolve_mr_max_fix_passes(_mr_tt)" in source
+    assert "_MR_MAX_FIX_PASSES = 2" not in source
 
 
 def test_reentrancy_guard_skips_inner_phase2(tmp_path):

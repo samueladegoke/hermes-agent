@@ -303,7 +303,7 @@ def test_run_conversation_routes_correction_pass_back_through_omx(mock_sys, monk
     assert result["final_response"] == "corrected OMX response"
     assert len(handoff_prompts) == 2
     assert handoff_prompts[0] is None
-    assert "CORRECTION PASS 1/2" in handoff_prompts[1]
+    assert "CORRECTION PASS 1/3" in handoff_prompts[1]
     assert "Add the missing edge-case notes." in handoff_prompts[1]
 
 

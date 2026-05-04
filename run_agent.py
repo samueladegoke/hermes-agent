@@ -68,6 +68,42 @@ class _BackgroundReviewToolPayload(TypedDict, total=False):
 from hermes_constants import get_hermes_home
 
 
+_MR_FIX_PASS_DEFAULTS = {
+    "code": 3,
+    "integration": 3,
+    "production": 3,
+    "audit": 2,
+    "research": 2,
+    "design": 2,
+    "config": 2,
+}
+
+
+def _resolve_mr_max_fix_passes(task_type: str, env: Optional[dict] = None) -> int:
+    """Resolve the meta-router correction retry cap for a routed task.
+
+    Precedence:
+    1. HERMES_MR_MAX_FIX_PASSES_<TYPE>
+    2. HERMES_MR_MAX_FIX_PASSES
+    3. task-type default
+
+    Negative values clamp to 0 so operators can disable correction retries.
+    """
+    env = env if env is not None else os.environ
+    task_key = str(task_type or "").lower()
+    env_key = task_key.upper()
+    default = _MR_FIX_PASS_DEFAULTS.get(task_key, 2)
+    raw = env.get(f"HERMES_MR_MAX_FIX_PASSES_{env_key}") or env.get(
+        "HERMES_MR_MAX_FIX_PASSES"
+    )
+
+    try:
+        value = int(raw) if raw is not None and str(raw).strip() else default
+    except (TypeError, ValueError):
+        value = default
+    return max(0, value)
+
+
 _OPENAI_CLS_CACHE: Optional[type] = None
 
 
@@ -14441,7 +14477,7 @@ class AIAgent:
                     )
                     final_response = ""
                 elif _mr_sdir and _mr_otask:
-                    _MR_MAX_FIX_PASSES = 2
+                    _MR_MAX_FIX_PASSES = _resolve_mr_max_fix_passes(_mr_tt)
                     _mr_fix_pass = 0
                     _mr_phase2 = _mr_p2(
                         _mr_rid, _mr_tt, _mr_otask, _mr_sdir,
