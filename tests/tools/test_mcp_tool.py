@@ -1302,6 +1302,22 @@ class TestSanitizeError:
         result = _sanitize_error("normal error message")
         assert result == "normal error message"
 
+    def test_empty_exception_message_falls_back_to_type_name(self):
+        """TimeoutError() stringifies empty; logs/tool errors must still name it."""
+        from tools.mcp_tool import _format_exception_for_log
+
+        result = _format_exception_for_log(TimeoutError())
+
+        assert result == "TimeoutError"
+
+    def test_exception_formatter_sanitizes_credentials(self):
+        from tools.mcp_tool import _format_exception_for_log
+
+        result = _format_exception_for_log(RuntimeError("failed with token=secret123"))
+
+        assert result == "RuntimeError: failed with [REDACTED]"
+        assert "token=" not in result
+
     def test_multiple_credentials(self):
         from tools.mcp_tool import _sanitize_error
         result = _sanitize_error("ghp_abc123 and sk-projXyz789 and token=foo")

@@ -301,6 +301,21 @@ def _sanitize_error(text: str) -> str:
     return _CREDENTIAL_PATTERN.sub("[REDACTED]", text)
 
 
+def _format_exception_for_log(exc: Exception) -> str:
+    """Return a sanitized exception string that never hides the exception type.
+
+    Some exceptions, notably bare ``TimeoutError()``, stringify to an empty
+    string. Logging only ``str(exc)`` then produces lines like
+    ``MCP tool qmd/query call failed:`` with no actionable cause. Include the
+    class name and append the sanitized message when present.
+    """
+    exc_type = type(exc).__name__
+    message = str(exc).strip()
+    if not message:
+        return exc_type
+    return _sanitize_error(f"{exc_type}: {message}")
+
+
 def _extract_mcp_content_text(content_blocks: List[Any]) -> str:
     """Return model-visible text from MCP content blocks.
 
@@ -2114,14 +2129,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 return recovered
 
             _bump_server_error(server_name)
+            _error_text = _format_exception_for_log(exc)
             logger.error(
                 "MCP tool %s/%s call failed: %s",
-                server_name, tool_name, exc,
+                server_name, tool_name, _error_text,
             )
             return json.dumps({
-                "error": _sanitize_error(
-                    f"MCP call failed: {type(exc).__name__}: {exc}"
-                )
+                "error": f"MCP call failed: {_error_text}"
             }, ensure_ascii=False)
 
     return _handler
