@@ -187,3 +187,166 @@ def test_do_phase2_enhances_fix_prompt_for_low_scores(monkeypatch, tmp_path):
             65.0,
         )
     ]
+
+
+
+def test_do_phase2_synthesizes_fix_prompt_for_delivery_gate_failure(monkeypatch, tmp_path):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "output.md").write_text("draft response", encoding="utf-8")
+    (state_dir / "scores.json").write_text(
+        json.dumps(
+            {
+                "total_weighted_score": 76,
+                "threshold": 70,
+                "verdict": "GOOD",
+                "dimensions": [
+                    {
+                        "name": "Completeness",
+                        "weighted": 7.5,
+                        "max_possible": 15,
+                        "reasoning": "Needs a wrap-up.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (state_dir / "delivery.json").write_text(
+        json.dumps(
+            {
+                "oracle": "PASS",
+                "delivery_gate": {
+                    "all_passed": False,
+                    "checks": {
+                        "score_threshold": {"passed": True, "detail": "Score: 76 >= 70"},
+                        "evidence_contract": {
+                            "passed": False,
+                            "detail": "errors=adversarial_findings.json: 1 unresolved medium/high finding(s)",
+                        },
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    som_pipeline = tmp_path / "som_pipeline.py"
+    som_pipeline.write_text("# stub\n", encoding="utf-8")
+
+    enhance_calls = []
+
+    def fake_enhance(path, task_text, task_type, score, threshold):
+        enhance_calls.append((Path(path), task_text, task_type, score, threshold))
+
+    monkeypatch.setattr(executor, "_SOM_PIPELINE", som_pipeline)
+    monkeypatch.setattr(executor, "populate_evidence_artifacts", lambda *args, **kwargs: None)
+    monkeypatch.setattr(executor, "_validate_evidence", lambda *args, **kwargs: (None, ""))
+    monkeypatch.setattr(executor, "_run_adv_pass", lambda *args, **kwargs: (None, None, ""))
+    monkeypatch.setattr(executor, "_load_log_writer", lambda: None)
+    monkeypatch.setattr(executor, "_maybe_trigger_optimizer", lambda: None)
+    monkeypatch.setattr(executor, "_enhance_fix_prompt", fake_enhance, raising=False)
+    monkeypatch.setattr(
+        executor.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"status": "complete", "passed": False}),
+            stderr="",
+        ),
+    )
+
+    phase2 = executor._do_phase2(
+        request_id="rid-2",
+        task_type="research",
+        task_text="Fix the delivery-gate evidence blocker",
+        som_state_dir=state_dir,
+        final_response="draft response",
+        t0=0.0,
+        routing_artifact_version="static-default",
+        session_id=None,
+    )
+
+    assert phase2.fix_prompt_path == str(state_dir / "fix_prompt.md")
+    fix_prompt = (state_dir / "fix_prompt.md").read_text(encoding="utf-8")
+    assert "evidence_contract" in fix_prompt
+    assert "unresolved medium/high finding" in fix_prompt
+    assert "Score 76/70" in fix_prompt
+    assert enhance_calls == [
+        (
+            state_dir / "fix_prompt.md",
+            "Fix the delivery-gate evidence blocker",
+            "research",
+            76.0,
+            70.0,
+        )
+    ]
+
+
+
+def test_do_phase2_preserves_delivery_gate_details_when_enhancing_existing_fix_prompt(monkeypatch, tmp_path):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "output.md").write_text("draft response", encoding="utf-8")
+    (state_dir / "scores.json").write_text(
+        json.dumps({"total_weighted_score": 76, "threshold": 70, "verdict": "GOOD"}),
+        encoding="utf-8",
+    )
+    (state_dir / "delivery.json").write_text(
+        json.dumps(
+            {
+                "oracle": "PASS",
+                "delivery_gate": {
+                    "all_passed": False,
+                    "checks": {
+                        "evidence_contract": {
+                            "passed": False,
+                            "detail": "errors=adversarial_findings.json: unresolved high finding",
+                        }
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (state_dir / "fix_prompt.md").write_text("Add a better wrap-up.", encoding="utf-8")
+
+    som_pipeline = tmp_path / "som_pipeline.py"
+    som_pipeline.write_text("# stub\n", encoding="utf-8")
+
+    def fake_enhance(path, task_text, task_type, score, threshold):
+        Path(path).write_text("Enhanced task-specific rewrite.\n", encoding="utf-8")
+
+    monkeypatch.setattr(executor, "_SOM_PIPELINE", som_pipeline)
+    monkeypatch.setattr(executor, "populate_evidence_artifacts", lambda *args, **kwargs: None)
+    monkeypatch.setattr(executor, "_validate_evidence", lambda *args, **kwargs: (None, ""))
+    monkeypatch.setattr(executor, "_run_adv_pass", lambda *args, **kwargs: (None, None, ""))
+    monkeypatch.setattr(executor, "_load_log_writer", lambda: None)
+    monkeypatch.setattr(executor, "_maybe_trigger_optimizer", lambda: None)
+    monkeypatch.setattr(executor, "_enhance_fix_prompt", fake_enhance, raising=False)
+    monkeypatch.setattr(
+        executor.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"status": "complete", "passed": False}),
+            stderr="",
+        ),
+    )
+
+    phase2 = executor._do_phase2(
+        request_id="rid-3",
+        task_type="research",
+        task_text="Fix the existing prompt path",
+        som_state_dir=state_dir,
+        final_response="draft response",
+        t0=0.0,
+        routing_artifact_version="static-default",
+        session_id=None,
+    )
+
+    assert phase2.fix_prompt_path == str(state_dir / "fix_prompt.md")
+    fix_prompt = (state_dir / "fix_prompt.md").read_text(encoding="utf-8")
+    assert "Enhanced task-specific rewrite" in fix_prompt
+    assert "evidence_contract" in fix_prompt
+    assert "unresolved high finding" in fix_prompt

@@ -591,11 +591,64 @@ def _validate_evidence(state_dir: Path) -> tuple[Optional[bool], str]:
 
 
 
-def _synthesize_fix_prompt(state_dir: Path, task_text: str, score: Optional[float], threshold: Optional[float]) -> Optional[Path]:
-    """Generate a minimal fix_prompt.md from scores.json when SoM did not create one.
+def _delivery_gate_failures(state_dir: Path) -> list[tuple[str, str]]:
+    """Return failed delivery-gate checks from delivery.json.
 
-    Used for trivial-tier tasks (max_iterations=1) that fail the score gate without
-    ever producing a fix_prompt -- the correction loop in run_agent.py needs this file.
+    The numeric score can pass while evidence/delivery checks still block final
+    delivery.  Those failures must be present in fix_prompt.md so correction
+    passes repair the actual blocker instead of chasing generic score feedback.
+    """
+    try:
+        delivery_data = _load_json_file(Path(state_dir) / "delivery.json")
+        delivery_gate = delivery_data.get("delivery_gate")
+        if not isinstance(delivery_gate, dict):
+            return []
+        checks = delivery_gate.get("checks")
+        if not isinstance(checks, dict):
+            return []
+        failures: list[tuple[str, str]] = []
+        for name, check in checks.items():
+            if not isinstance(check, dict) or check.get("passed") is not False:
+                continue
+            detail = str(check.get("detail") or "").strip()
+            failures.append((str(name), detail))
+        return failures
+    except Exception:
+        return []
+
+
+
+def _append_delivery_gate_failures_to_fix_prompt(path: Path, state_dir: Path) -> None:
+    """Append failed delivery-gate checks to fix_prompt.md if absent."""
+    failures = _delivery_gate_failures(state_dir)
+    if not failures:
+        return
+    try:
+        original = Path(path)
+        content = original.read_text(encoding="utf-8") if original.exists() else ""
+        missing = [
+            (name, detail)
+            for name, detail in failures
+            if name not in content or (detail and detail not in content)
+        ]
+        if not missing:
+            return
+        lines = ["", "Delivery gate failures that must be fixed:"]
+        for name, detail in missing:
+            suffix = f": {detail}" if detail else ""
+            lines.append(f"- **{name}**{suffix}")
+        original.write_text(content.rstrip() + "\n\n" + "\n".join(lines).strip() + "\n", encoding="utf-8")
+    except Exception:
+        return
+
+
+
+def _synthesize_fix_prompt(state_dir: Path, task_text: str, score: Optional[float], threshold: Optional[float]) -> Optional[Path]:
+    """Generate fix_prompt.md when SoM did not create one.
+
+    Used for tasks that fail either the score gate or a downstream delivery gate
+    without producing a fix prompt.  The correction loop in run_agent.py needs
+    this file to feed concrete repair instructions back into the model.
     """
     scores_path = state_dir / "scores.json"
     fix_prompt_path = state_dir / "fix_prompt.md"
@@ -604,11 +657,9 @@ def _synthesize_fix_prompt(state_dir: Path, task_text: str, score: Optional[floa
 
     try:
         scores_data = _load_json_file(scores_path)
-        if not scores_data:
-            return None
-
-        dimensions = scores_data.get("dimensions", [])
-        if not dimensions:
+        dimensions = scores_data.get("dimensions", []) if isinstance(scores_data, dict) else []
+        delivery_failures = _delivery_gate_failures(state_dir)
+        if not dimensions and not delivery_failures:
             return None
 
         effective_threshold = threshold or 65
@@ -617,18 +668,27 @@ def _synthesize_fix_prompt(state_dir: Path, task_text: str, score: Optional[floa
             if d.get("max_possible", 0) > 0
             and (d.get("weighted", 0) / d.get("max_possible", 1)) < 0.6
         ]
-        if not failing:
+        if not failing and dimensions:
             failing = sorted(dimensions, key=lambda d: d.get("weighted", 0) / max(d.get("max_possible", 1), 1))[:2]
 
-        lines = [
-            "Score {:.0f}/{:.0f} - the following areas need improvement:".format(score, effective_threshold),
-        ]
+        if score is not None:
+            score_line = "Score {:.0f}/{:.0f}".format(score, effective_threshold)
+        else:
+            score_line = "Delivery gate rejected the draft"
+        lines = [f"{score_line} - the following areas need correction:"]
         for d in failing:
             name = d.get("name", "Unknown")
             got = d.get("weighted", 0)
             possible = d.get("max_possible", 0)
             reasoning = d.get("reasoning", "")
             lines.append("- **{}** ({:.0f}/{:.0f}): {}".format(name, got, possible, reasoning))
+
+        if delivery_failures:
+            lines.append("")
+            lines.append("Delivery gate failures that must be fixed:")
+            for name, detail in delivery_failures:
+                suffix = f": {detail}" if detail else ""
+                lines.append(f"- **{name}**{suffix}")
 
         lines.append("")
         lines.append("Revise your response to address these gaps, citing live evidence where relevant.")
@@ -1056,14 +1116,6 @@ def _do_phase2(
             ref_entry = data.get("ref_entry") or delivery_json.get("ref_entry")
             delivery_path = data.get("delivery_path") or (str(delivery_json_path) if delivery_json_path.exists() else None)
             fix_prompt_path = str(fix_prompt) if fix_prompt.exists() else None
-            # If SoM did not generate fix_prompt (trivial-tier, max_iterations=1),
-            # synthesize one from scores so the run_agent.py correction loop can fire.
-            if not fix_prompt_path and som_score is not None and som_score < (threshold or 65):
-                _synth = _synthesize_fix_prompt(som_state_dir, task_text, som_score, threshold)
-                if _synth:
-                    fix_prompt_path = str(_synth)
-            if fix_prompt_path and som_score is not None and som_score < (threshold or 65):
-                _enhance_fix_prompt(Path(fix_prompt_path), task_text, task_type, som_score, threshold)
             notes.append(f"artifact={routing_artifact_version}")
             if session_id:
                 notes.append(f"session={session_id}")
@@ -1102,6 +1154,25 @@ def _do_phase2(
                     notes.append(f"adv_findings={adv_findings_count}")
                 elif adv_preview:
                     notes.append(f"adv_preview={adv_preview}")
+
+            score_gate_failed = som_score is not None and som_score < (threshold or 65)
+            needs_correction = (
+                delivery_gate_passed is False
+                or oracle_verdict == "FAIL"
+                or adv_pass_clean is False
+                or bool(error)
+                or score_gate_failed
+            )
+            # If SoM did not generate fix_prompt, synthesize one from score and
+            # delivery-gate evidence so run_agent.py can perform a correction pass.
+            if not fix_prompt_path and needs_correction:
+                _synth = _synthesize_fix_prompt(som_state_dir, task_text, som_score, threshold)
+                if _synth:
+                    fix_prompt_path = str(_synth)
+            if fix_prompt_path and needs_correction:
+                _append_delivery_gate_failures_to_fix_prompt(Path(fix_prompt_path), som_state_dir)
+                _enhance_fix_prompt(Path(fix_prompt_path), task_text, task_type, som_score, threshold)
+                _append_delivery_gate_failures_to_fix_prompt(Path(fix_prompt_path), som_state_dir)
         else:
             error = "phase2 skipped: missing som_state_dir or som_pipeline"
     except Exception as exc:
