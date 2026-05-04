@@ -104,6 +104,28 @@ def _validate_image_url(url: str) -> bool:
     return True
 
 
+def _describe_invalid_image_source(source: Any) -> str:
+    """Return safe diagnostic text for an invalid image source.
+
+    Avoid logging full local paths or full URLs because they may contain private
+    directory names, tokens, or signed query strings. The description is only a
+    source kind plus minimal routing information for debugging.
+    """
+    if not isinstance(source, str) or not source.strip():
+        return f"type={type(source).__name__} empty={not bool(source)}"
+
+    value = source.strip()
+    parsed = urlparse(value)
+    if parsed.scheme in {"http", "https"}:
+        return f"url scheme={parsed.scheme} host={parsed.hostname or '<missing>'}"
+    if parsed.scheme and parsed.scheme != "file":
+        return f"unsupported_scheme scheme={parsed.scheme}"
+
+    local_value = value[len("file://"):] if value.startswith("file://") else value
+    path = Path(os.path.expanduser(local_value))
+    return f"local_path basename={path.name or '<empty>'} exists={path.is_file()}"
+
+
 def _detect_image_mime_type(image_path: Path) -> Optional[str]:
     """Return a MIME type when the file looks like a supported image."""
     with image_path.open("rb") as f:
@@ -491,6 +513,10 @@ async def vision_analyze_tool(
             await _download_image(image_url, temp_image_path)
             should_cleanup = True
         else:
+            logger.warning(
+                "Invalid image source rejected before vision analysis (%s)",
+                _describe_invalid_image_source(image_url),
+            )
             raise ValueError(
                 "Invalid image source. Provide an HTTP/HTTPS URL or a valid local file path."
             )

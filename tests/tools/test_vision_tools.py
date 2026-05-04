@@ -12,6 +12,7 @@ import pytest
 
 from tools.vision_tools import (
     _validate_image_url,
+    _describe_invalid_image_source,
     _handle_vision_analyze,
     _determine_mime_type,
     _image_to_base64_data_url,
@@ -115,6 +116,28 @@ class TestValidateImageUrl:
 
     def test_rejects_list(self):
         assert _validate_image_url(["https://example.com"]) is False
+
+
+class TestInvalidImageSourceDiagnostics:
+    """Invalid vision source diagnostics should be useful without leaking secrets."""
+
+    def test_describes_url_without_path_or_query_string(self):
+        description = _describe_invalid_image_source(
+            "https://cdn.example.test/image.png?sig=redacted"
+        )
+
+        assert description == "url scheme=https host=cdn.example.test"
+        assert "sig" not in description
+        assert "image.png" not in description
+
+    def test_describes_local_path_by_basename_and_existence_only(self, tmp_path):
+        missing = tmp_path / "private-dir" / "missing-image.png"
+
+        description = _describe_invalid_image_source(str(missing))
+
+        assert description == "local_path basename=missing-image.png exists=False"
+        assert "private-dir" not in description
+        assert str(tmp_path) not in description
 
 
 # ---------------------------------------------------------------------------
