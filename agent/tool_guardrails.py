@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -63,13 +64,13 @@ MUTATING_TOOL_NAMES = frozenset(
 class ToolCallGuardrailConfig:
     """Thresholds for per-turn tool-call loop detection.
 
-    Warnings are enabled by default and never prevent tool execution. Hard stops
-    are explicit opt-in so interactive CLI/TUI sessions get a gentle nudge unless
-    the user enables circuit-breaker behavior in config.yaml.
+    Warnings and hard stops are enabled by default. Warnings give the model a
+    chance to self-correct; hard stops then act as a circuit breaker for loops
+    that repeatedly call a failing or non-progressing tool path unchanged.
     """
 
     warnings_enabled: bool = True
-    hard_stop_enabled: bool = False
+    hard_stop_enabled: bool = True
     exact_failure_warn_after: int = 2
     exact_failure_block_after: int = 5
     same_tool_failure_warn_after: int = 3
@@ -132,7 +133,7 @@ class ToolCallSignature:
 
     @classmethod
     def from_call(cls, tool_name: str, args: Mapping[str, Any] | None) -> "ToolCallSignature":
-        canonical = canonical_tool_args(args or {})
+        canonical = canonical_tool_args(_normalize_args_for_signature(tool_name, args or {}))
         return cls(tool_name=tool_name, args_hash=_sha256(canonical))
 
     def to_metadata(self) -> dict[str, str]:
@@ -405,6 +406,48 @@ def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> s
 
 def _coerce_args(args: Mapping[str, Any] | None) -> Mapping[str, Any]:
     return args if isinstance(args, Mapping) else {}
+
+
+def _normalize_args_for_signature(tool_name: str, args: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Normalize known non-progressing argument patterns for loop detection.
+
+    A common vision failure mode is speculative retries with different fake local
+    paths (for example ``/tmp/nonexistent4``). Those are semantically the same
+    invalid image source even though the raw strings differ, so normalize them
+    into one guardrail signature. Existing local files and HTTP/HTTPS URLs are
+    preserved unchanged.
+    """
+    if tool_name != "vision_analyze" or not isinstance(args, Mapping):
+        return args
+
+    source_key = None
+    for key in ("image_url", "image_path", "image_source"):
+        if key in args:
+            source_key = key
+            break
+    if source_key is None:
+        return args
+
+    source = args.get(source_key)
+    if not isinstance(source, str) or not source.strip():
+        normalized = dict(args)
+        normalized[source_key] = "__missing_image_source__"
+        return normalized
+
+    source_text = source.strip()
+    if source_text.startswith(("http://", "https://")):
+        return args
+    if source_text.startswith("file://"):
+        source_text = source_text[len("file://"):]
+    if Path(source_text).expanduser().is_file():
+        return args
+
+    normalized = dict(args)
+    normalized[source_key] = "__invalid_local_image_source__"
+    for prompt_key in ("question", "prompt", "user_prompt"):
+        if prompt_key in normalized:
+            normalized[prompt_key] = "__omitted_for_invalid_image_source__"
+    return normalized
 
 
 def _result_hash(result: str | None) -> str:

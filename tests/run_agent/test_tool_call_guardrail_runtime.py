@@ -86,10 +86,10 @@ def _hard_stop_config(**overrides) -> dict:
     return cfg
 
 
-def test_default_sequential_path_warns_repeated_exact_failure_without_blocking_execution():
+def test_default_sequential_path_blocks_repeated_exact_failure_before_execution():
     agent = _make_agent("web_search")
     args = {"query": "same"}
-    _seed_exact_failures(agent, "web_search", args)
+    _seed_exact_failures(agent, "web_search", args, count=5)
     starts = []
     progress = []
     agent.tool_start_callback = lambda *a, **k: starts.append((a, k))
@@ -98,18 +98,44 @@ def test_default_sequential_path_warns_repeated_exact_failure_without_blocking_e
     msg = SimpleNamespace(content="", tool_calls=[tc])
     messages = []
 
-    with patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as mock_hfc:
+    with patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc:
         agent._execute_tool_calls_sequential(msg, messages, "task-1")
 
-    mock_hfc.assert_called_once()
-    assert len(starts) == 1
-    assert any(event[0][0] == "tool.completed" for event in progress)
+    mock_hfc.assert_not_called()
+    assert starts == []
+    assert progress == []
     assert len(messages) == 1
     assert messages[0]["role"] == "tool"
     assert messages[0]["tool_call_id"] == "c-soft"
-    assert "repeated_exact_failure_warning" in messages[0]["content"]
-    assert "repeated_exact_failure_block" not in messages[0]["content"]
-    assert agent._tool_guardrail_halt_decision is None
+    assert "repeated_exact_failure_block" in messages[0]["content"]
+    assert agent._tool_guardrail_halt_decision is not None
+
+
+def test_default_blocks_repeated_vision_invalid_local_sources_even_when_path_changes():
+    agent = _make_agent("vision_analyze")
+    for idx in range(5):
+        agent._tool_guardrails.after_call(
+            "vision_analyze",
+            {"image_url": f"/tmp/nonexistent{idx}", "question": f"try {idx}"},
+            json.dumps({"success": False, "error": "Invalid image source"}),
+            failed=True,
+        )
+    starts = []
+    agent.tool_start_callback = lambda *a, **k: starts.append((a, k))
+    tc = _mock_tool_call(
+        "vision_analyze",
+        json.dumps({"image_url": "/tmp/nonexistent6", "question": "try again"}),
+        "c-vision-block",
+    )
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc:
+        agent._execute_tool_calls_sequential(SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1")
+
+    mock_hfc.assert_not_called()
+    assert starts == []
+    assert len(messages) == 1
+    assert "repeated_exact_failure_block" in messages[0]["content"]
 
 
 def test_config_enabled_hard_stop_blocks_repeated_exact_failure_before_execution():
@@ -207,7 +233,7 @@ def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     assert agent._tool_guardrails.before_call("web_search", args).action == "allow"
 
 
-def test_default_run_conversation_warns_without_guardrail_halt():
+def test_default_run_conversation_hard_stops_repeated_exact_failures():
     agent = _make_agent("web_search", max_iterations=10)
     same_args = {"query": "same"}
     responses = [
@@ -216,9 +242,8 @@ def test_default_run_conversation_warns_without_guardrail_halt():
             finish_reason="tool_calls",
             tool_calls=[_mock_tool_call("web_search", json.dumps(same_args), f"c{i}")],
         )
-        for i in range(1, 4)
+        for i in range(1, 10)
     ]
-    responses.append(_mock_response(content="done", finish_reason="stop", tool_calls=None))
     agent.client.chat.completions.create.side_effect = responses
 
     with (
@@ -229,12 +254,12 @@ def test_default_run_conversation_warns_without_guardrail_halt():
     ):
         result = agent.run_conversation("search repeatedly")
 
-    assert mock_hfc.call_count == 3
-    assert result["turn_exit_reason"].startswith("text_response")
-    assert "guardrail" not in result
-    assert result["final_response"] == "done"
+    assert mock_hfc.call_count == 5
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert result["guardrail"]["code"] == "repeated_exact_failure_block"
+    assert "stopped retrying" in result["final_response"]
     tool_contents = [m["content"] for m in result["messages"] if m.get("role") == "tool"]
-    assert any("repeated_exact_failure_warning" in content for content in tool_contents)
+    assert any("repeated_exact_failure_block" in content for content in tool_contents)
 
 
 def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_halt_without_top_level_error():
