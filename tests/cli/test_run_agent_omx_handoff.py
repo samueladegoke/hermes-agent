@@ -368,3 +368,132 @@ def test_run_conversation_keeps_normal_path_when_omx_disabled(mock_sys, monkeypa
     )
 
     assert result["final_response"] == "normal response"
+
+
+@patch("run_agent.AIAgent._build_system_prompt", return_value="system prompt")
+def test_native_correction_pass_is_internal_and_not_persisted(mock_sys, monkeypatch, tmp_path):
+    from run_agent import AIAgent
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "fix_prompt.md").write_text("Add the missing verification section.", encoding="utf-8")
+
+    route_calls = []
+
+    def fake_route(**kwargs):
+        route_calls.append(kwargs["text"])
+        return SimpleNamespace(
+            request_id="rid-native-correct",
+            type="research",
+            mode="execute",
+            directive="[META-ROUTER | research | execute]",
+            bypassed=False,
+            confidence=1.0,
+            routing_artifact_version="candidate-0011",
+        )
+
+    monkeypatch.setattr("gateway.meta_router_runtime.make_route_decision", fake_route)
+    monkeypatch.setattr(
+        "gateway.meta_router_executor.run_phase1",
+        lambda task_text, mr_type: SimpleNamespace(
+            phase1_ok=True,
+            state_dir=state_dir,
+            targets_context="[SoM Targets | research]",
+        ),
+    )
+
+    phase2_results = [
+        SimpleNamespace(
+            request_id="rid-native-correct",
+            task_type="research",
+            state_dir=state_dir,
+            routing_artifact_version="candidate-0011",
+            passed=False,
+            score=76.0,
+            verdict="GOOD",
+            threshold=70.0,
+            oracle_verdict="PASS",
+            adv_pass_clean=True,
+            adv_findings_count=0,
+            delivery_gate_passed=False,
+            score_card=None,
+            ref_entry=None,
+            delivery_path=None,
+            fix_prompt_path=str(state_dir / "fix_prompt.md"),
+            error=None,
+            notes=[],
+            som_score=76.0,
+            eop_score=100.0,
+            composite_score=85.6,
+        ),
+        _phase2_result(state_dir),
+    ]
+    monkeypatch.setattr("gateway.meta_router_executor.run_phase2", lambda *args, **kwargs: phase2_results.pop(0))
+    monkeypatch.setattr(
+        "gateway.meta_router_executor.format_routed_response",
+        lambda final_response, phase2, directive="": final_response,
+    )
+
+    persisted_batches = []
+
+    def fake_persist(self, messages, conversation_history=None):
+        persisted_batches.append([dict(m) for m in messages])
+
+    monkeypatch.setattr("run_agent.AIAgent._persist_session", fake_persist)
+    monkeypatch.setattr("run_agent.AIAgent._save_trajectory", lambda *args, **kwargs: None)
+    monkeypatch.setattr("run_agent.AIAgent._cleanup_task_resources", lambda *args, **kwargs: None)
+
+    responses = iter([
+        SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="initial native response", tool_calls=None, refusal=None, reasoning_content=None),
+                finish_reason="stop",
+            )],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+            model="test-model",
+            id="resp-initial",
+        ),
+        SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="corrected native response", tool_calls=None, refusal=None, reasoning_content=None),
+                finish_reason="stop",
+            )],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+            model="test-model",
+            id="resp-corrected",
+        ),
+    ])
+    monkeypatch.setattr("run_agent.AIAgent._interruptible_streaming_api_call", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr("run_agent.AIAgent._interruptible_api_call", lambda *args, **kwargs: next(responses))
+
+    agent = AIAgent(
+        model="test/model",
+        base_url="https://api.openai.com/v1",
+        api_key="test-key",
+        api_mode="chat_completions",
+        quiet_mode=True,
+        skip_memory=True,
+        skip_context_files=True,
+    )
+    agent.client = None
+
+    result = agent.run_conversation(
+        user_message="Research the live evidence and summarize the fix.",
+        conversation_history=[],
+    )
+
+    assert result["final_response"] == "corrected native response"
+    assert route_calls == ["Research the live evidence and summarize the fix."]
+    assert persisted_batches
+    persisted_text = json.dumps(persisted_batches)
+    assert "[MR correction pass — not user-visible]" not in persisted_text
+    assert "CORRECTION PASS 1/2" not in persisted_text
+
+
+def test_run_conversation_has_one_meta_router_post_turn_block():
+    import inspect
+    from run_agent import AIAgent
+
+    src = inspect.getsource(AIAgent.run_conversation)
+
+    assert src.count("MR-ALS post-turn: SoM Phase 2 scoring") == 1

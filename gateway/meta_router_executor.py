@@ -661,6 +661,8 @@ def _synthesize_fix_prompt(state_dir: Path, task_text: str, score: Optional[floa
         delivery_failures = _delivery_gate_failures(state_dir)
         if not dimensions and not delivery_failures:
             return None
+        if score is None and not delivery_failures:
+            return None
 
         effective_threshold = threshold or 65
         failing = [
@@ -1018,7 +1020,7 @@ def _do_phase2(
     state_dir = som_state_dir
 
     try:
-        if som_state_dir and _SOM_PIPELINE.exists():
+        if som_state_dir:
             out_md = som_state_dir / "output.md"
             scores_path = som_state_dir / "scores.json"
             delivery_json_path = som_state_dir / "delivery.json"
@@ -1029,38 +1031,41 @@ def _do_phase2(
                 out_md.write_text(final_response, encoding="utf-8")
             populate_evidence_artifacts(task_text, out_md.read_text(encoding="utf-8") if out_md.exists() else final_response, som_state_dir)
 
-            som_type = _MR_TO_SOM_TYPE.get(task_type, "code")
-            som_tier = resolve_phase2_tier(som_state_dir)
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(_SOM_PIPELINE),
-                    "--complete",
-                    "--task",
-                    task_text[:2000],
-                    "--task-type",
-                    som_type,
-                    "--tier",
-                    som_tier,
-                    "--task-id",
-                    som_state_dir.name,
-                    "--state-dir",
-                    str(som_state_dir),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=180,
-            )
-
-            preview = (result.stderr or result.stdout or "").strip()
             data = {}
-            if result.returncode not in (0, 1):
-                error = f"som complete exit {result.returncode}: {preview[:200]}"
+            if _SOM_PIPELINE.exists():
+                som_type = _MR_TO_SOM_TYPE.get(task_type, "code")
+                som_tier = resolve_phase2_tier(som_state_dir)
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(_SOM_PIPELINE),
+                        "--complete",
+                        "--task",
+                        task_text[:2000],
+                        "--task-type",
+                        som_type,
+                        "--tier",
+                        som_tier,
+                        "--task-id",
+                        som_state_dir.name,
+                        "--state-dir",
+                        str(som_state_dir),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                )
+
+                preview = (result.stderr or result.stdout or "").strip()
+                if result.returncode not in (0, 1):
+                    error = f"som complete exit {result.returncode}: {preview[:200]}"
+                else:
+                    data = _parse_json_payload(result.stdout)
+                    notes.append(f"som_status={data.get('status', 'unknown')}")
+                    if result.returncode == 1:
+                        notes.append("som_returncode=1")
             else:
-                data = _parse_json_payload(result.stdout)
-                notes.append(f"som_status={data.get('status', 'unknown')}")
-                if result.returncode == 1:
-                    notes.append("som_returncode=1")
+                notes.append("som_status=artifact-only")
 
             scores_json = _load_json_file(scores_path)
             delivery_json = _load_json_file(delivery_json_path)

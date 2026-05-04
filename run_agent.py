@@ -10905,6 +10905,7 @@ class AIAgent:
         task_id: str = None,
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[str] = None,
+        internal_turn: bool = False,
     ) -> Dict[str, Any]:
         """
         Run a complete conversation with tool calling until completion.
@@ -10920,7 +10921,10 @@ class AIAgent:
             persist_user_message: Optional clean user message to store in
                 transcripts/history when user_message contains API-only
                 synthetic prefixes.
-                    or queuing follow-up prefetch work.
+            internal_turn: When True, run an internal model pass without
+                meta-router preclassification or session persistence. Used by
+                the meta-router correction loop so fix prompts do not become
+                user-visible conversation turns after restart/resume.
 
         Returns:
             Dict: Complete conversation result with final response and message history
@@ -10958,92 +10962,102 @@ class AIAgent:
         if isinstance(persist_user_message, str):
             persist_user_message = sanitize_context(persist_user_message)
 
-        # meta-router: pre-classify Hermes turns with the shared MR-ALS runtime.
-        # Direct classify (no HTTP) + RouteDecision + event logging + SoM Phase 1.
-        self._mr_request_id = None
-        self._mr_task_type = None
-        self._mr_mode = None
-        self._mr_start_time = None
-        self._mr_som_state_dir = None
-        self._mr_original_task = None
-        self._mr_routing_artifact_version = None
-        self._mr_directive = None
-        self._mr_targets_context = None
-        self._mr_context_brief_path = None
-        _mr_platform = getattr(self, "platform", None) or "cli"
-        _mr_source = "cli" if _mr_platform == "cli" else "gateway"
-        _prefixed_directive, _prefixed_type, _prefixed_mode = _parse_meta_router_directive(user_message)
-        if _prefixed_directive:
-            self._mr_directive = _prefixed_directive
-            self._mr_task_type = _prefixed_type
-            self._mr_mode = _prefixed_mode
-            self._mr_original_task = user_message
-            if persist_user_message is None:
-                persist_user_message = user_message
-        elif isinstance(user_message, str) and user_message:
-            try:
-                import time as _mr_time
-                _mr_t0 = _mr_time.time()
-                from gateway.meta_router_runtime import make_route_decision as _mr_decide
-                _mr_dec = _mr_decide(
-                    text=user_message,
-                    source=_mr_source,
-                    surface=_mr_platform,
-                    session_id=getattr(self, "session_id", None),
-                )
-                _mr_prepend = getattr(_mr_dec, "prepend_text", None) or _mr_dec.directive
-                _mr_original = user_message
+        if not internal_turn:
+            # meta-router: pre-classify Hermes turns with the shared MR-ALS runtime.
+            # Direct classify (no HTTP) + RouteDecision + event logging + SoM Phase 1.
+            self._mr_request_id = None
+            self._mr_task_type = None
+            self._mr_mode = None
+            self._mr_start_time = None
+            self._mr_som_state_dir = None
+            self._mr_original_task = None
+            self._mr_routing_artifact_version = None
+            self._mr_directive = None
+            self._mr_targets_context = None
+            self._mr_context_brief_path = None
+            _mr_platform = getattr(self, "platform", None) or "cli"
+            _mr_source = "cli" if _mr_platform == "cli" else "gateway"
+            _prefixed_directive, _prefixed_type, _prefixed_mode = _parse_meta_router_directive(user_message)
+            if _prefixed_directive:
+                self._mr_directive = _prefixed_directive
+                self._mr_task_type = _prefixed_type
+                self._mr_mode = _prefixed_mode
+                self._mr_original_task = user_message
                 if persist_user_message is None:
-                    persist_user_message = _mr_original
-                if not _mr_dec.bypassed and _mr_prepend:
-                    user_message = f"{_mr_prepend}\n{user_message}"
-                    self._mr_request_id = _mr_dec.request_id
-                    self._mr_task_type = _mr_dec.type
-                    self._mr_mode = getattr(_mr_dec, "mode", None)
-                    self._mr_start_time = _mr_t0
-                    self._mr_original_task = _mr_original
-                    self._mr_routing_artifact_version = getattr(_mr_dec, "routing_artifact_version", None)
-                    self._mr_directive = _mr_dec.directive
-                    # Phase 1: generate SoM targets (fast, rule-based — no LLM).
-                    if len(_mr_original) >= 40 and _mr_dec.confidence >= 0.35:
-                        try:
-                            from gateway.meta_router_executor import run_phase1 as _mr_p1
-                            _prep = _mr_p1(_mr_original, _mr_dec.type)
-                            if _prep.phase1_ok and _prep.targets_context:
-                                self._mr_som_state_dir = _prep.state_dir
-                                self._mr_targets_context = _prep.targets_context
-                                # Phase 1b: pre-execution context brief
-                                # For research/audit/production tasks, gather relevant
-                                # context BEFORE Hermes runs so it knows where to look
-                                # rather than discovering everything through tool calls.
-                                _mr_ctx_brief = None
-                                try:
-                                    from gateway.meta_router_context import (
-                                        gather_pre_execution_context as _mr_gather_ctx,
-                                    )
-                                    _mr_ctx_brief = _mr_gather_ctx(
-                                        task_text=_mr_original,
-                                        task_type=_mr_dec.type,
-                                        state_dir=_prep.state_dir,
-                                    )
-                                except Exception:
-                                    pass  # context gather is non-fatal
-                                if _mr_ctx_brief:
-                                    self._mr_context_brief_path = str(Path(_prep.state_dir) / "context_brief.json")
-                                    user_message = (
-                                        f"{_mr_prepend}\n\n"                                        f"{_prep.targets_context}\n\n"
-                                        f"[CONTEXT BRIEF]\n{_mr_ctx_brief}\n\n"
-                                        f"{_mr_original}"
-                                    )
-                                else:
-                                    user_message = (
-                                        f"{_mr_prepend}\n\n"                                        f"{_prep.targets_context}\n\n"
-                                        f"{_mr_original}"
-                                    )
-                        except Exception:
-                            pass  # Phase 1 failure is non-fatal
-            except Exception:
-                pass  # meta-router runtime unavailable — proceed without directive
+                    persist_user_message = user_message
+            elif (
+                isinstance(user_message, str)
+                and user_message
+                and not user_message.startswith("[META-ROUTER |")
+            ):
+                try:
+                    import time as _mr_time
+                    _mr_t0 = _mr_time.time()
+                    from gateway.meta_router_runtime import make_route_decision as _mr_decide
+                    _mr_dec = _mr_decide(
+                        text=user_message,
+                        source=_mr_source,
+                        surface=_mr_platform,
+                        session_id=getattr(self, "session_id", None),
+                    )
+                    _mr_prepend = getattr(_mr_dec, "prepend_text", None) or _mr_dec.directive
+                    _mr_original = user_message
+                    if persist_user_message is None:
+                        persist_user_message = _mr_original
+                    if not _mr_dec.bypassed and _mr_prepend:
+                        user_message = f"{_mr_prepend}\n{user_message}"
+                        self._mr_request_id = _mr_dec.request_id
+                        self._mr_task_type = _mr_dec.type
+                        self._mr_mode = getattr(_mr_dec, "mode", None)
+                        self._mr_start_time = _mr_t0
+                        self._mr_original_task = _mr_original
+                        self._mr_routing_artifact_version = getattr(_mr_dec, "routing_artifact_version", None)
+                        self._mr_directive = _mr_dec.directive
+                        # Phase 1: generate SoM targets (fast, rule-based — no LLM).
+                        if len(_mr_original) >= 40 and _mr_dec.confidence >= 0.35:
+                            try:
+                                from gateway.meta_router_executor import run_phase1 as _mr_p1
+                                _prep = _mr_p1(_mr_original, _mr_dec.type)
+                                if _prep.phase1_ok and _prep.targets_context:
+                                    self._mr_som_state_dir = _prep.state_dir
+                                    self._mr_targets_context = _prep.targets_context
+                                    # Phase 1b: pre-execution context brief
+                                    # For research/audit/production tasks, gather relevant
+                                    # context BEFORE Hermes runs so it knows where to look
+                                    # rather than discovering everything through tool calls.
+                                    _mr_ctx_brief = None
+                                    try:
+                                        from gateway.meta_router_context import (
+                                            gather_pre_execution_context as _mr_gather_ctx,
+                                        )
+                                        _mr_ctx_brief = _mr_gather_ctx(
+                                            task_text=_mr_original,
+                                            task_type=_mr_dec.type,
+                                            state_dir=_prep.state_dir,
+                                        )
+                                    except Exception:
+                                        pass  # context gather is non-fatal
+                                    if _mr_ctx_brief:
+                                        self._mr_context_brief_path = str(Path(_prep.state_dir) / "context_brief.json")
+                                        user_message = (
+                                            f"{_mr_prepend}\n\n"                                        f"{_prep.targets_context}\n\n"
+                                            f"[CONTEXT BRIEF]\n{_mr_ctx_brief}\n\n"
+                                            f"{_mr_original}"
+                                        )
+                                    else:
+                                        user_message = (
+                                            f"{_mr_prepend}\n\n"                                        f"{_prep.targets_context}\n\n"
+                                            f"{_mr_original}"
+                                        )
+                            except Exception:
+                                pass  # Phase 1 failure is non-fatal
+                except Exception:
+                    pass  # meta-router runtime unavailable — proceed without directive
+        else:
+            # Internal correction passes are continuity for the outer routed
+            # turn. They must not create a new route/request/state dir; the
+            # outer post-turn Phase 2 block owns evaluation and final delivery.
+            pass
 
         self._apply_turn_tool_policy()
         # Store stream callback for _interruptible_api_call to pick up
@@ -11735,7 +11749,8 @@ class AIAgent:
                                 primary_recovery_attempted = False
                                 continue
                             # No fallback available — return with clear message
-                            self._persist_session(messages, conversation_history)
+                            if not internal_turn:
+                                self._persist_session(messages, conversation_history)
                             return {
                                 "final_response": (
                                     f"⏳ {_nous_msg}\n\n"
@@ -12028,7 +12043,8 @@ class AIAgent:
                                 continue
                             self._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
                             logging.error(f"{self.log_prefix}Invalid API response after {max_retries} retries.")
-                            self._persist_session(messages, conversation_history)
+                            if not internal_turn:
+                                self._persist_session(messages, conversation_history)
                             return {
                                 "messages": messages,
                                 "completed": False,
@@ -12048,7 +12064,8 @@ class AIAgent:
                         while time.time() < sleep_end:
                             if self._interrupt_requested:
                                 self._vprint(f"{self.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
-                                self._persist_session(messages, conversation_history)
+                                if not internal_turn:
+                                    self._persist_session(messages, conversation_history)
                                 self.clear_interrupt()
                                 return {
                                     "final_response": f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries}).",
@@ -12179,7 +12196,8 @@ class AIAgent:
                                 "→ Or switch to a larger/non-reasoning model with `/model`"
                             )
                             self._cleanup_task_resources(effective_task_id)
-                            self._persist_session(messages, conversation_history)
+                            if not internal_turn:
+                                self._persist_session(messages, conversation_history)
                             return {
                                 "final_response": _exhaust_response,
                                 "messages": messages,
@@ -12219,7 +12237,8 @@ class AIAgent:
 
                                 partial_response = self._strip_think_blocks(truncated_response_prefix).strip()
                                 self._cleanup_task_resources(effective_task_id)
-                                self._persist_session(messages, conversation_history)
+                                if not internal_turn:
+                                    self._persist_session(messages, conversation_history)
                                 return {
                                     "final_response": partial_response or None,
                                     "messages": messages,
@@ -12247,7 +12266,8 @@ class AIAgent:
                                     force=True,
                                 )
                                 self._cleanup_task_resources(effective_task_id)
-                                self._persist_session(messages, conversation_history)
+                                if not internal_turn:
+                                    self._persist_session(messages, conversation_history)
                                 return {
                                     "final_response": None,
                                     "messages": messages,
@@ -12263,7 +12283,8 @@ class AIAgent:
                             rolled_back_messages = self._get_messages_up_to_last_assistant(messages)
 
                             self._cleanup_task_resources(effective_task_id)
-                            self._persist_session(messages, conversation_history)
+                            if not internal_turn:
+                                self._persist_session(messages, conversation_history)
 
                             return {
                                 "final_response": None,
@@ -12276,7 +12297,8 @@ class AIAgent:
                         else:
                             # First message was truncated - mark as failed
                             self._vprint(f"{self.log_prefix}❌ First response truncated - cannot recover", force=True)
-                            self._persist_session(messages, conversation_history)
+                            if not internal_turn:
+                                self._persist_session(messages, conversation_history)
                             return {
                                 "final_response": None,
                                 "messages": messages,
@@ -12423,7 +12445,8 @@ class AIAgent:
                         self.thinking_callback("")
                     api_elapsed = time.time() - api_start_time
                     self._vprint(f"{self.log_prefix}⚡ Interrupted during API call.", force=True)
-                    self._persist_session(messages, conversation_history)
+                    if not internal_turn:
+                        self._persist_session(messages, conversation_history)
                     interrupted = True
                     final_response = f"Operation interrupted: waiting for model response ({api_elapsed:.1f}s elapsed)."
                     break
@@ -12850,7 +12873,8 @@ class AIAgent:
                     # Check for interrupt before deciding to retry
                     if self._interrupt_requested:
                         self._vprint(f"{self.log_prefix}⚡ Interrupt detected during error handling, aborting retries.", force=True)
-                        self._persist_session(messages, conversation_history)
+                        if not internal_turn:
+                            self._persist_session(messages, conversation_history)
                         self.clear_interrupt()
                         return {
                             "final_response": f"Operation interrupted: handling API error ({error_type}: {self._clean_error_message(str(api_error))}).",
@@ -13021,7 +13045,8 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
                             self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logging.error(f"{self.log_prefix}413 compression failed after {max_compression_attempts} attempts.")
-                            self._persist_session(messages, conversation_history)
+                            if not internal_turn:
+                                self._persist_session(messages, conversation_history)
                             return {
                                 "messages": messages,
                                 "completed": False,
@@ -13052,7 +13077,8 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}❌ Payload too large and cannot compress further.", force=True)
                             self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logging.error(f"{self.log_prefix}413 payload too large. Cannot compress further.")
-                            self._persist_session(messages, conversation_history)
+                            if not internal_turn:
+                                self._persist_session(messages, conversation_history)
                             return {
                                 "messages": messages,
                                 "completed": False,
@@ -13105,7 +13131,8 @@ class AIAgent:
                                 self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                                 self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                                 logging.error(f"{self.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
-                                self._persist_session(messages, conversation_history)
+                                if not internal_turn:
+                                    self._persist_session(messages, conversation_history)
                                 return {
                                     "messages": messages,
                                     "completed": False,
@@ -13178,7 +13205,8 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                             self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logging.error(f"{self.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
-                            self._persist_session(messages, conversation_history)
+                            if not internal_turn:
+                                self._persist_session(messages, conversation_history)
                             return {
                                 "messages": messages,
                                 "completed": False,
@@ -13211,7 +13239,8 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
                             self._vprint(f"{self.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
                             logging.error(f"{self.log_prefix}Context length exceeded: {approx_tokens:,} tokens. Cannot compress further.")
-                            self._persist_session(messages, conversation_history)
+                            if not internal_turn:
+                                self._persist_session(messages, conversation_history)
                             return {
                                 "messages": messages,
                                 "completed": False,
@@ -13312,7 +13341,8 @@ class AIAgent:
                                 force=True,
                             )
                         else:
-                            self._persist_session(messages, conversation_history)
+                            if not internal_turn:
+                                self._persist_session(messages, conversation_history)
                         return {
                             "final_response": None,
                             "messages": messages,
@@ -13385,7 +13415,8 @@ class AIAgent:
                             self._dump_api_request_debug(
                                 api_kwargs, reason="max_retries_exhausted", error=api_error,
                             )
-                        self._persist_session(messages, conversation_history)
+                        if not internal_turn:
+                            self._persist_session(messages, conversation_history)
                         _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
                         if _is_stream_drop:
                             _final_response += (
@@ -13436,7 +13467,8 @@ class AIAgent:
                     while time.time() < sleep_end:
                         if self._interrupt_requested:
                             self._vprint(f"{self.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
-                            self._persist_session(messages, conversation_history)
+                            if not internal_turn:
+                                self._persist_session(messages, conversation_history)
                             self.clear_interrupt()
                             return {
                                 "final_response": f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries}).",
@@ -13485,7 +13517,8 @@ class AIAgent:
             if response is None:
                 _turn_exit_reason = "all_retries_exhausted_no_response"
                 print(f"{self.log_prefix}❌ All API retries exhausted with no successful response.")
-                self._persist_session(messages, conversation_history)
+                if not internal_turn:
+                    self._persist_session(messages, conversation_history)
                 break
 
             try:
@@ -13590,7 +13623,8 @@ class AIAgent:
                         
                         rolled_back_messages = self._get_messages_up_to_last_assistant(messages)
                         self._cleanup_task_resources(effective_task_id)
-                        self._persist_session(messages, conversation_history)
+                        if not internal_turn:
+                            self._persist_session(messages, conversation_history)
                         
                         return {
                             "final_response": None,
@@ -13652,7 +13686,8 @@ class AIAgent:
                         continue
 
                     self._codex_incomplete_retries = 0
-                    self._persist_session(messages, conversation_history)
+                    if not internal_turn:
+                        self._persist_session(messages, conversation_history)
                     return {
                         "final_response": None,
                         "messages": messages,
@@ -13698,7 +13733,8 @@ class AIAgent:
                         if self._invalid_tool_retries >= 3:
                             self._vprint(f"{self.log_prefix}❌ Max retries (3) for invalid tool calls exceeded. Stopping as partial.", force=True)
                             self._invalid_tool_retries = 0
-                            self._persist_session(messages, conversation_history)
+                            if not internal_turn:
+                                self._persist_session(messages, conversation_history)
                             return {
                                 "final_response": None,
                                 "messages": messages,
@@ -13764,7 +13800,8 @@ class AIAgent:
                             )
                             self._invalid_json_retries = 0
                             self._cleanup_task_resources(effective_task_id)
-                            self._persist_session(messages, conversation_history)
+                            if not internal_turn:
+                                self._persist_session(messages, conversation_history)
                             return {
                                 "final_response": None,
                                 "messages": messages,
@@ -14358,8 +14395,11 @@ class AIAgent:
         # Clean up VM and browser for this task after conversation completes
         self._cleanup_task_resources(effective_task_id)
 
-        # Persist session to both JSON log and SQLite
-        self._persist_session(messages, conversation_history)
+        # Persist session to both JSON log and SQLite. Internal correction
+        # passes are evaluated by the outer routed turn and must not leak into
+        # session history as user-visible turns.
+        if not internal_turn:
+            self._persist_session(messages, conversation_history)
 
         # MR-ALS post-turn: SoM Phase 2 scoring + outcome logging + receipt formatting.
         # Reentrancy guard: when a correction pass re-enters run_conversation, the outer
@@ -14445,6 +14485,7 @@ class AIAgent:
                                         user_message=_fix_prefix,
                                         conversation_history=list(messages),
                                         persist_user_message="[MR correction pass — not user-visible]",
+                                        internal_turn=True,
                                     )
                                 finally:
                                     self._mr_in_correction = False
@@ -14687,138 +14728,14 @@ class AIAgent:
         except Exception as exc:
             logger.warning("on_session_end hook failed: %s", exc)
 
-        # MR-ALS post-turn: SoM Phase 2 scoring + outcome logging + receipt formatting.
-        # Reentrancy guard: when a correction pass re-enters run_conversation, the outer
-        # call still owns phase2 evaluation — inner calls must return their draft verbatim.
-        _mr_rid = getattr(self, "_mr_request_id", None)
-        _mr_in_correction = getattr(self, "_mr_in_correction", False)
-        if _mr_rid and final_response and final_response.strip() and not _mr_in_correction:
-            try:
-                from gateway.meta_router_executor import (
-                    format_routed_response as _mr_fmt,
-                    run_phase2 as _mr_p2,
-                    run_outcome_only as _mr_out_only,
-                )
-                _mr_sdir = getattr(self, "_mr_som_state_dir", None)
-                _mr_tt = getattr(self, "_mr_task_type", None) or "research"
-                _mr_t0 = getattr(self, "_mr_start_time", None) or 0.0
-                _mr_otask = getattr(self, "_mr_original_task", None) or ""
-                _mr_art = getattr(self, "_mr_routing_artifact_version", None) or "static-default"
-                _mr_sid = getattr(self, "session_id", None)
-                _mr_directive = getattr(self, "_mr_directive", None) or ""
-                if _mr_sdir and _mr_otask:
-                    # Keep the correction budget small and deterministic.
-                    # The recursion bug came from nested re-entry, not from the cap itself.
-                    _MR_MAX_FIX_PASSES = 2
-                    _mr_fix_pass = 0
-                    _mr_phase2 = _mr_p2(_mr_rid, _mr_tt, _mr_otask, _mr_sdir,
-                                        final_response, _mr_t0, _mr_art, _mr_sid)
-                    # Correction loop: if phase2 fails and fix_prompt exists,
-                    # re-run the agent with targeted fix instructions.
-                    while (
-                        not _mr_phase2.passed
-                        and _mr_fix_pass < _MR_MAX_FIX_PASSES
-                        and _mr_phase2.fix_prompt_path
-                    ):
-                        _mr_fix_pass += 1
-                        try:
-                            from pathlib import Path as _MRPath
-                            _fix_instructions = _MRPath(_mr_phase2.fix_prompt_path).read_text(encoding="utf-8")
-                            _score_str = (
-                                f"{_mr_phase2.score:.0f}"
-                                if _mr_phase2.score is not None else "?"
-                            )
-                            _thresh_str = (
-                                f"{_mr_phase2.threshold:.0f}"
-                                if _mr_phase2.threshold is not None else "?"
-                            )
-                            _fix_prefix = (
-                                f"CORRECTION PASS {_mr_fix_pass}/{_MR_MAX_FIX_PASSES} — "
-                                f"Score was {_score_str}/{_thresh_str}, revision needed before delivery.\n\n"
-                                f"{_fix_instructions}\n\n"
-                                f"Revise and restate your complete response below."
-                            )
-                            # Run a fresh correction pass. For routed code work with
-                            # the OMX harness enabled, re-enter OMX directly so the
-                            # external executor owns the revision loop too.
-                            _fix_response = ""
-                            _use_omx_correction = (
-                                _mr_tt == "code"
-                                and self._omx_executor_enabled()
-                                and getattr(self, "_mr_som_state_dir", None)
-                            )
-                            if _use_omx_correction:
-                                _fix_response, _fix_exec_result = self._run_omx_handoff(
-                                    correction_task_text=_fix_prefix,
-                                )
-                                if not _fix_response:
-                                    raise RuntimeError(
-                                        f"OMX correction pass produced no output: {_fix_exec_result}"
-                                    )
-                            else:
-                                # Fall back to a fresh agent turn with the correction prompt,
-                                # sharing conversation history so tools remain available.
-                                # Set reentrancy flag so the inner call skips its own phase2 block.
-                                self._mr_in_correction = True
-                                try:
-                                    _fix_result = self.run_conversation(
-                                        user_message=_fix_prefix,
-                                        conversation_history=list(messages),
-                                        persist_user_message="[MR correction pass — not user-visible]",
-                                    )
-                                finally:
-                                    self._mr_in_correction = False
-                                _fix_response = (_fix_result.get("final_response") or "").strip()
-                            if _fix_response:
-                                final_response = _fix_response
-                                # output.md already exists from the first evaluation.
-                                # Explicitly overwrite it so SoM scores the corrected
-                                # text — the write-guard in run_phase2_async skips the
-                                # write when the file is already present.
-                                try:
-                                    (_MRPath(_mr_sdir) / "output.md").write_text(
-                                        final_response, encoding="utf-8"
-                                    )
-                                except Exception:
-                                    pass
-                                # Re-evaluate with the corrected output
-                                _mr_phase2 = _mr_p2(
-                                    _mr_rid, _mr_tt, _mr_otask, _mr_sdir,
-                                    final_response, _mr_t0, _mr_art, _mr_sid,
-                                )
-                        except Exception as _mr_fix_exc:
-                            import logging as _mr_logging
-                            _mr_logging.getLogger("meta_router").warning(
-                                "MR correction pass %d failed: %s", _mr_fix_pass, _mr_fix_exc
-                            )
-                            break  # non-fatal — proceed with last result
-                    final_response = _mr_fmt(final_response, _mr_phase2, directive=_mr_directive)
-                    result["final_response"] = final_response
-                    for _mr_msg in reversed(messages):
-                        if _mr_msg.get("role") == "assistant":
-                            _mr_msg["content"] = final_response
-                            break
-                else:
-                    _mr_out_only(_mr_rid, _mr_tt, _mr_t0, _mr_art, _mr_sid)
-            except Exception as _mr_p2_exc:
-                import logging as _mr_logging
-                _mr_logging.getLogger("meta_router").warning(
-                    "MR phase2 block failed: %s", _mr_p2_exc
-                )
-            finally:
-                self._mr_request_id = None
-                self._mr_som_state_dir = None
-                self._mr_task_type = None
-                self._mr_start_time = None
-                self._mr_original_task = None
-                self._mr_routing_artifact_version = None
-                self._mr_directive = None
-                self._mr_targets_context = None
-                self._mr_context_brief_path = None
+        # MR-ALS post-turn already ran above before diagnostics/hooks. Keep a
+        # single authoritative Phase 2/correction loop so fix prompts, state
+        # resets, source/surface metadata, and final persistence cannot diverge.
 
         # Re-persist after MR post-turn processing so session JSON/SQLite reflect
         # the final user-visible answer rather than the pre-evaluation draft.
-        self._persist_session(messages, conversation_history)
+        if not internal_turn:
+            self._persist_session(messages, conversation_history)
 
         return result
 
