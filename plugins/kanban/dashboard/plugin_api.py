@@ -176,6 +176,120 @@ def _run_dict(r: kanban_db.Run) -> dict[str, Any]:
     }
 
 
+# Hallucination-warning event kinds — see complete_task() in kanban_db.py.
+# completion_blocked_hallucination: kernel rejected created_cards with
+#   phantom ids; task stays in prior state.
+# suspected_hallucinated_references: prose scan found t_<hex> in summary
+#   that doesn't resolve; completion succeeded, advisory only.
+_WARNING_EVENT_KINDS = (
+    "completion_blocked_hallucination",
+    "suspected_hallucinated_references",
+)
+
+
+def _compute_task_diagnostics(
+    conn: sqlite3.Connection,
+    task_ids: Optional[list[str]] = None,
+) -> dict[str, list[dict]]:
+    """Run the diagnostic rule engine against every task (or a subset)
+    and return ``{task_id: [diagnostic_dict, ...]}``.
+
+    Tasks with no active diagnostics are omitted from the result.
+    Uses ``hermes_cli.kanban_diagnostics`` — see that module for the
+    rule definitions.
+    """
+    from hermes_cli import kanban_diagnostics as kd
+
+    # Build the candidate task list. We need each task's row + its
+    # events + its runs. Doing N separate queries works but scales
+    # poorly; do three aggregate queries instead.
+    if task_ids is not None:
+        if not task_ids:
+            return {}
+        placeholders = ",".join(["?"] * len(task_ids))
+        rows = conn.execute(
+            f"SELECT * FROM tasks WHERE id IN ({placeholders})",
+            tuple(task_ids),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE status != 'archived'",
+        ).fetchall()
+
+    if not rows:
+        return {}
+
+    # Index events + runs by task id. For very large boards this will
+    # slurp a lot — acceptable on the dashboard's typical working set
+    # (hundreds of tasks), but we can add pagination / filtering later
+    # if profiling shows it's a hotspot.
+    row_ids = [r["id"] for r in rows]
+    placeholders = ",".join(["?"] * len(row_ids))
+    events_by_task: dict[str, list] = {tid: [] for tid in row_ids}
+    for ev_row in conn.execute(
+        f"SELECT * FROM task_events WHERE task_id IN ({placeholders}) ORDER BY id",
+        tuple(row_ids),
+    ).fetchall():
+        events_by_task.setdefault(ev_row["task_id"], []).append(ev_row)
+    runs_by_task: dict[str, list] = {tid: [] for tid in row_ids}
+    for run_row in conn.execute(
+        f"SELECT * FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY id",
+        tuple(row_ids),
+    ).fetchall():
+        runs_by_task.setdefault(run_row["task_id"], []).append(run_row)
+
+    out: dict[str, list[dict]] = {}
+    for r in rows:
+        tid = r["id"]
+        diags = kd.compute_task_diagnostics(
+            r,
+            events_by_task.get(tid, []),
+            runs_by_task.get(tid, []),
+        )
+        if diags:
+            out[tid] = [d.to_dict() for d in diags]
+    return out
+
+
+def _warnings_summary_from_diagnostics(
+    diagnostics: list[dict],
+) -> Optional[dict]:
+    """Compact summary for cards: {count, highest_severity, kinds,
+    latest_at}. Replaces the old hallucination-only ``warnings`` object
+    — same shape additions plus ``highest_severity`` so the UI can color
+    badges per diagnostic severity.
+
+    Returns None when ``diagnostics`` is empty.
+    """
+    if not diagnostics:
+        return None
+    from hermes_cli.kanban_diagnostics import SEVERITY_ORDER
+
+    kinds: dict[str, int] = {}
+    latest = 0
+    highest_idx = -1
+    highest_sev: Optional[str] = None
+    count = 0
+    for d in diagnostics:
+        kinds[d["kind"]] = kinds.get(d["kind"], 0) + d.get("count", 1)
+        count += d.get("count", 1)
+        la = d.get("last_seen_at") or 0
+        if la > latest:
+            latest = la
+        sev = d.get("severity")
+        if sev in SEVERITY_ORDER:
+            idx = SEVERITY_ORDER.index(sev)
+            if idx > highest_idx:
+                highest_idx = idx
+                highest_sev = sev
+    return {
+        "count": count,
+        "kinds": kinds,
+        "latest_at": latest,
+        "highest_severity": highest_sev,
+    }
+
+
 def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
     """Return {'parents': [...], 'children': [...]} for a task."""
     parents = [
@@ -253,6 +367,12 @@ def get_board(
             if row["cstatus"] == "done":
                 p["done"] += 1
 
+        # Diagnostics rollup for this board — see kanban_diagnostics.
+        # We get the full structured list per task AND a compact
+        # summary for the card badge (so cards don't carry the detail
+        # text; the drawer fetches that via /tasks/:id or /diagnostics).
+        diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None)
+
         latest_event_id = conn.execute(
             "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
         ).fetchone()["m"]
@@ -266,6 +386,13 @@ def get_board(
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
+            diags = diagnostics_per_task.get(t.id)
+            if diags:
+                # Full list goes into the payload so the drawer can render
+                # without a second round-trip. The board-level badge only
+                # needs the summary.
+                d["diagnostics"] = diags
+                d["warnings"] = _warnings_summary_from_diagnostics(diags)
             col = t.status if t.status in columns else "todo"
             columns[col].append(d)
 
@@ -313,8 +440,16 @@ def get_task(task_id: str, board: Optional[str] = Query(None)):
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        task_d = _task_dict(task)
+        # Attach diagnostics so the drawer's Diagnostics section can
+        # render recovery actions without a second round-trip.
+        diags = _compute_task_diagnostics(conn, task_ids=[task_id])
+        diag_list = diags.get(task_id) or []
+        if diag_list:
+            task_d["diagnostics"] = diag_list
+            task_d["warnings"] = _warnings_summary_from_diagnostics(diag_list)
         return {
-            "task": _task_dict(task),
+            "task": task_d,
             "comments": [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)],
             "events": [_event_dict(e) for e in kanban_db.list_events(conn, task_id)],
             "links": _links_for(conn, task_id),
@@ -630,6 +765,9 @@ class BulkTaskBody(BaseModel):
     assignee: Optional[str] = None  # "" or None = unassign
     priority: Optional[int] = None
     archive: bool = False
+    result: Optional[str] = None
+    summary: Optional[str] = None
+    metadata: Optional[dict] = None
 
 
 @router.post("/tasks/bulk")
@@ -660,7 +798,12 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 if payload.status is not None and not payload.archive:
                     s = payload.status
                     if s == "done":
-                        ok = kanban_db.complete_task(conn, tid)
+                        ok = kanban_db.complete_task(
+                            conn, tid,
+                            result=payload.result,
+                            summary=payload.summary,
+                            metadata=payload.metadata,
+                        )
                     elif s == "blocked":
                         ok = kanban_db.block_task(conn, tid)
                     elif s == "ready":
@@ -701,6 +844,168 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 entry.update(ok=False, error=str(e))
             results.append(entry)
         return {"results": results}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics — fleet-wide distress signals (hallucinations, crashes,
+# spawn failures, stuck-blocked). See hermes_cli.kanban_diagnostics for
+# the rule engine.
+# ---------------------------------------------------------------------------
+
+@router.get("/diagnostics")
+def list_diagnostics(
+    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    severity: Optional[str] = Query(
+        None,
+        description="Filter by severity: warning|error|critical",
+    ),
+):
+    """Return ``[{task_id, task_title, task_status, task_assignee,
+    diagnostics: [...]}, ...]`` for every task on the board with at
+    least one active diagnostic.
+
+    Severity-filterable so the UI can render "just the critical ones"
+    or the CLI can grep. Useful for the board-header attention strip
+    AND for ``hermes kanban diagnostics`` which shells to this
+    endpoint when the dashboard's running, or invokes the engine
+    directly when it isn't.
+    """
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        diags_by_task = _compute_task_diagnostics(conn, task_ids=None)
+        if not diags_by_task:
+            return {"diagnostics": [], "count": 0}
+
+        # Narrow by severity if asked.
+        if severity:
+            filtered: dict[str, list[dict]] = {}
+            for tid, dl in diags_by_task.items():
+                keep = [d for d in dl if d.get("severity") == severity]
+                if keep:
+                    filtered[tid] = keep
+            diags_by_task = filtered
+            if not diags_by_task:
+                return {"diagnostics": [], "count": 0}
+
+        # Pull the task rows we need in one query so we can include
+        # titles/statuses without a per-task lookup.
+        ids = list(diags_by_task.keys())
+        placeholders = ",".join(["?"] * len(ids))
+        rows = {
+            r["id"]: r
+            for r in conn.execute(
+                f"SELECT id, title, status, assignee FROM tasks WHERE id IN ({placeholders})",
+                tuple(ids),
+            ).fetchall()
+        }
+
+        out = []
+        for tid, dl in diags_by_task.items():
+            r = rows.get(tid)
+            out.append({
+                "task_id": tid,
+                "task_title": r["title"] if r else None,
+                "task_status": r["status"] if r else None,
+                "task_assignee": r["assignee"] if r else None,
+                "diagnostics": dl,
+            })
+        # Sort: highest severity first, then most recent.
+        from hermes_cli.kanban_diagnostics import SEVERITY_ORDER
+        sev_idx = {s: i for i, s in enumerate(SEVERITY_ORDER)}
+        def _sort_key(row):
+            top = row["diagnostics"][0]
+            return (
+                -sev_idx.get(top.get("severity"), -1),
+                -(top.get("last_seen_at") or 0),
+            )
+        out.sort(key=_sort_key)
+
+        return {
+            "diagnostics": out,
+            "count": sum(len(d["diagnostics"]) for d in out),
+        }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Recovery actions — reclaim a running claim, reassign to a new profile
+# ---------------------------------------------------------------------------
+
+class ReclaimBody(BaseModel):
+    reason: Optional[str] = None
+
+
+@router.post("/tasks/{task_id}/reclaim")
+def reclaim_task_endpoint(
+    task_id: str,
+    payload: ReclaimBody,
+    board: Optional[str] = Query(None),
+):
+    """Release an active worker claim on a running task.
+
+    Used by the dashboard recovery popover when an operator wants to
+    abort a stuck worker (e.g. one that keeps hallucinating card ids)
+    without waiting for the claim TTL. Maps 1:1 to
+    ``hermes kanban reclaim <task_id> --reason ...``.
+    """
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        ok = kanban_db.reclaim_task(conn, task_id, reason=payload.reason)
+        if not ok:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"cannot reclaim {task_id}: not in a claimable state "
+                    "(not running, or unknown id)"
+                ),
+            )
+        return {"ok": True, "task_id": task_id}
+    finally:
+        conn.close()
+
+
+class ReassignBody(BaseModel):
+    profile: Optional[str] = None  # "" or None = unassign
+    reclaim_first: bool = False
+    reason: Optional[str] = None
+
+
+@router.post("/tasks/{task_id}/reassign")
+def reassign_task_endpoint(
+    task_id: str,
+    payload: ReassignBody,
+    board: Optional[str] = Query(None),
+):
+    """Reassign a task to a different profile, optionally reclaiming first.
+
+    Used by the dashboard recovery popover when an operator wants to
+    retry a task with a different worker profile (e.g. switch to a
+    smarter model after the assigned profile keeps hallucinating).
+    Maps 1:1 to ``hermes kanban reassign <task_id> <profile> [--reclaim]``.
+    """
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        ok = kanban_db.reassign_task(
+            conn, task_id,
+            payload.profile or None,
+            reclaim_first=bool(payload.reclaim_first),
+            reason=payload.reason,
+        )
+        if not ok:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"cannot reassign {task_id}: unknown id, or still "
+                    "running (pass reclaim_first=true to release the claim first)"
+                ),
+            )
+        return {"ok": True, "task_id": task_id, "assignee": payload.profile or None}
     finally:
         conn.close()
 
