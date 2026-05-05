@@ -50,6 +50,33 @@ def test_vision_analyze_nonexistent_local_paths_share_guardrail_signature():
     assert sig_a != sig_http
 
 
+def test_vision_analyze_noop_prompt_blocks_before_execution():
+    controller = ToolCallGuardrailController()
+
+    decision = controller.before_call(
+        "vision_analyze",
+        {"image_url": "https://httpbin.org/image/png", "question": "noop"},
+    )
+
+    assert decision.action == "block"
+    assert decision.code == "vision_noop_substitute_block"
+    assert "substitute for code/action tools" in decision.message
+    assert "terminal" in decision.message
+    assert controller.halt_decision == decision
+
+
+def test_vision_analyze_real_image_question_remains_allowed():
+    controller = ToolCallGuardrailController()
+
+    decision = controller.before_call(
+        "vision_analyze",
+        {"image_url": "https://example.com/cat.png", "question": "What objects are visible?"},
+    )
+
+    assert decision.action == "allow"
+    assert decision.code == "allow"
+
+
 def test_default_config_enables_hard_stops_with_conservative_thresholds():
     cfg = ToolCallGuardrailConfig()
 

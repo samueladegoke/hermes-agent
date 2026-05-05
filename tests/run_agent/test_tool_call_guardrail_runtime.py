@@ -138,6 +138,27 @@ def test_default_blocks_repeated_vision_invalid_local_sources_even_when_path_cha
     assert "repeated_exact_failure_block" in messages[0]["content"]
 
 
+def test_default_blocks_vision_noop_placeholder_before_execution():
+    agent = _make_agent("vision_analyze", "terminal", "write_file", "patch")
+    starts = []
+    agent.tool_start_callback = lambda *a, **k: starts.append((a, k))
+    tc = _mock_tool_call(
+        "vision_analyze",
+        json.dumps({"image_url": "https://httpbin.org/image/png", "question": "noop"}),
+        "c-vision-noop-block",
+    )
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc:
+        agent._execute_tool_calls_sequential(SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1")
+
+    mock_hfc.assert_not_called()
+    assert starts == []
+    assert len(messages) == 1
+    assert "vision_noop_substitute_block" in messages[0]["content"]
+    assert "terminal" in messages[0]["content"]
+
+
 def test_config_enabled_hard_stop_blocks_repeated_exact_failure_before_execution():
     agent = _make_agent("web_search", config=_hard_stop_config())
     args = {"query": "same"}

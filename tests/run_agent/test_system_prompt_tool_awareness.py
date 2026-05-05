@@ -64,5 +64,45 @@ def test_system_prompt_warns_not_to_invent_vision_image_paths():
     prompt = agent._build_system_prompt()
 
     assert "Vision input rule" in prompt
+    assert "only when the task needs visual image understanding" in prompt
     assert "Do not invent, guess, or fuzz image paths" in prompt
     assert "/tmp/nonexistent" in prompt
+    assert "Do not call vision_analyze as a noop" in prompt
+
+
+def test_system_prompt_redirects_nonvisual_execute_tasks_to_active_action_tools():
+    with (
+        patch(
+            "run_agent.get_tool_definitions",
+            return_value=_make_tool_defs(
+                "vision_analyze",
+                "terminal",
+                "read_file",
+                "search_files",
+                "write_file",
+                "patch",
+            ),
+        ),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            model="openai-codex/gpt-5.4",
+        )
+
+    prompt = agent._build_system_prompt()
+
+    assert "Tool selection sanity" in prompt
+    assert "prefer the action tools that are actually active here" in prompt
+    assert "terminal" in prompt
+    assert "write_file" in prompt
+    assert "correct course immediately" in prompt
+    assert "Do not use unrelated tools merely to make a tool call" in prompt
+    assert "substitute for terminal, read_file, search_files, write_file, or patch" in prompt
+    assert "accidental vision_analyze result appears during a non-visual task" in prompt

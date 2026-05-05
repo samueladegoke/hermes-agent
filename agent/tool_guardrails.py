@@ -237,7 +237,24 @@ class ToolCallGuardrailController:
         return self._halt_decision
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
-        signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+        coerced_args = _coerce_args(args)
+        signature = ToolCallSignature.from_call(tool_name, coerced_args)
+        if tool_name == "vision_analyze" and _is_vision_noop_substitute(coerced_args):
+            decision = ToolGuardrailDecision(
+                action="block",
+                code="vision_noop_substitute_block",
+                message=(
+                    "Blocked vision_analyze: vision analysis cannot be used as a noop, "
+                    "availability probe, or substitute for code/action tools. Resume with "
+                    "the appropriate active tool such as terminal, read_file, search_files, "
+                    "write_file, or patch."
+                ),
+                tool_name=tool_name,
+                count=1,
+                signature=signature,
+            )
+            self._halt_decision = decision
+            return decision
         if not self.config.hard_stop_enabled:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
@@ -448,6 +465,36 @@ def _normalize_args_for_signature(tool_name: str, args: Mapping[str, Any]) -> Ma
         if prompt_key in normalized:
             normalized[prompt_key] = "__omitted_for_invalid_image_source__"
     return normalized
+
+
+def _is_vision_noop_substitute(args: Mapping[str, Any]) -> bool:
+    """Return True for vision calls that are obviously placeholders/noops.
+
+    This catches the recurring failure mode where a non-visual code/config task
+    emits a syntactically valid vision call (for example httpbin's sample image
+    with question="noop") merely to satisfy tool-use pressure. Real image
+    analysis prompts remain allowed.
+    """
+    if not isinstance(args, Mapping):
+        return False
+    prompt_value = None
+    for prompt_key in ("question", "prompt", "user_prompt"):
+        value = args.get(prompt_key)
+        if isinstance(value, str):
+            prompt_value = value.strip().lower()
+            break
+    if prompt_value is None:
+        return False
+    normalized = " ".join(prompt_value.replace("_", "-").split())
+    return normalized in {
+        "noop",
+        "no-op",
+        "no operation",
+        "no-op/noop",
+        "tool availability probe",
+        "availability probe",
+    }
+
 
 
 def _result_hash(result: str | None) -> str:

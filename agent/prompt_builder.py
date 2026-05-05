@@ -281,13 +281,32 @@ def build_active_tool_availability_prompt(available_tools) -> str:
         "platform, enabled toolsets, disabled toolsets, MCP health, and delegated/cron "
         "session restrictions."
     )
+    action_tools = [
+        tool
+        for tool in ("terminal", "execute_code", "read_file", "search_files", "write_file", "patch")
+        if tool in names
+    ]
+    if action_tools:
+        prompt += (
+            "\nTool selection sanity: for code/config/production/integration execute "
+            "tasks, prefer the action tools that are actually active here ("
+            + ", ".join(action_tools)
+            + "). If a prior attempt used an irrelevant tool or claimed one of these "
+            "tools was unavailable, correct course immediately by calling the right "
+            "active action tool. Do not use unrelated tools merely to make a tool call."
+        )
     if "vision_analyze" in names:
         prompt += (
             "\nVision input rule: call vision_analyze only with an HTTP/HTTPS image URL "
             "or an existing local image file path that came from the user or a prior "
-            "tool result. Do not invent, guess, or fuzz image paths such as "
+            "tool result, and only when the task needs visual image understanding. "
+            "Do not invent, guess, or fuzz image paths such as "
             "`/tmp/nonexistent`; if no image source is available, ask for one or use "
-            "an appropriate browser/image-capture tool first."
+            "an appropriate browser/image-capture tool first. Do not call "
+            "vision_analyze as a noop, placeholder, availability probe, or substitute "
+            "for terminal, read_file, search_files, write_file, or patch. If an "
+            "accidental vision_analyze result appears during a non-visual task, treat "
+            "it as irrelevant and resume with the correct active action tool."
         )
     return prompt
 
