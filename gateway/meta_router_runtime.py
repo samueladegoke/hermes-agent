@@ -20,11 +20,12 @@ import uuid
 from dataclasses import dataclass
 
 from gateway.meta_router_memory import build_memory_plan, format_memory_plan_block
+from gateway.meta_router_paths import meta_router_dir
 from pathlib import Path
 from typing import Optional
 
-# ── Absolute paths ─────────────────────────────────────────────────────────
-_MR_DIR = Path("/home/samade10/.openclaw/workspace/skills/maintainer/meta-router")
+# ── Runtime paths ───────────────────────────────────────────────────────────
+_MR_DIR = meta_router_dir()
 _LOG_WRITER_PATH = _MR_DIR / "experience/log_writer.py"
 _LOAD_ROUTING_PATH = _MR_DIR / "scripts/load_active_routing.py"
 

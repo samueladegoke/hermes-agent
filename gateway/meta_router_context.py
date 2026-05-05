@@ -24,10 +24,10 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-_CONTEXT_GATHERER = Path(
-    "/home/samade10/.openclaw/workspace/rql/scripts/context_gatherer.py"
-)
-_WORKSPACE_ROOT = Path("/home/samade10/.openclaw/workspace")
+from gateway.meta_router_paths import openclaw_workspace, rql_scripts_dir
+
+_CONTEXT_GATHERER = rql_scripts_dir() / "context_gatherer.py"
+_WORKSPACE_ROOT = openclaw_workspace()
 
 # Task types that get pre-execution context gathering
 _CONTEXT_TYPES = {"research", "audit", "production"}

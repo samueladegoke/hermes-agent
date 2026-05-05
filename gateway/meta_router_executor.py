@@ -32,8 +32,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-# ── Absolute paths ─────────────────────────────────────────────────────────────
-_MR_DIR = Path("/home/samade10/.openclaw/workspace/skills/maintainer/meta-router")
+from gateway.meta_router_paths import meta_router_dir, openclaw_workspace, rql_scripts_dir
+
+# ── Runtime paths ─────────────────────────────────────────────────────────────
+_MR_DIR = meta_router_dir()
 _EXP_DIR = _MR_DIR / "experience"
 _SCRIPTS_DIR = _MR_DIR / "scripts"
 _LOG_WRITER_PATH = _EXP_DIR / "log_writer.py"
@@ -42,8 +44,8 @@ _EVENTS_JSONL = _EXP_DIR / "routing_events.jsonl"
 _OUTCOMES_JSONL = _EXP_DIR / "routing_outcomes.jsonl"
 _RUNNER_PATH = _SCRIPTS_DIR / "mr_als_runner.py"
 
-_WORKSPACE = Path("/home/samade10/.openclaw/workspace")
-_RQL_SCRIPTS_DIR = _WORKSPACE / "rql/scripts"
+_WORKSPACE = openclaw_workspace()
+_RQL_SCRIPTS_DIR = rql_scripts_dir()
 _SOM_PIPELINE = _RQL_SCRIPTS_DIR / "som_pipeline.py"
 _ADV_PASS = _RQL_SCRIPTS_DIR / "adv_pass.py"
 _EVIDENCE_CONTRACT = _RQL_SCRIPTS_DIR / "evidence_contract.py"
