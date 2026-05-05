@@ -18,6 +18,81 @@ DEFAULT_WORKFLOW = "plain"
 DEFAULT_TIMEOUT_SECONDS = 600
 
 
+def _safe_timeout_seconds(value: Any) -> int:
+    """Return a positive timeout, falling back when policy input is invalid."""
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_TIMEOUT_SECONDS
+    return timeout if timeout > 0 else DEFAULT_TIMEOUT_SECONDS
+
+
+def _clear_previous_artifact(path: Path) -> None:
+    """Remove a stale per-attempt artifact without touching directories."""
+    try:
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+    except FileNotFoundError:
+        return
+
+
+def _prepare_attempt_artifacts(output_path: Path, result_path: Path) -> None:
+    """Ensure this OMX attempt cannot reuse output from a previous attempt."""
+    _clear_previous_artifact(output_path)
+    _clear_previous_artifact(result_path)
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    """Read a JSON object from disk; invalid/missing/non-object data is empty."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _result_from_artifacts(
+    *,
+    result_path: Path,
+    output_path: Path,
+    base: Mapping[str, Any],
+    returncode: int | None,
+    stdout: str,
+    stderr: str,
+    timed_out: bool = False,
+    timeout_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Normalize OMX artifacts into a trustworthy executor result."""
+    result = _read_json_object(result_path) if result_path.exists() else {}
+    for key, value in base.items():
+        result.setdefault(key, value)
+    result.setdefault("returncode", returncode)
+    result.setdefault("stdout", stdout)
+    result.setdefault("stderr", stderr)
+
+    if timed_out:
+        result["timed_out"] = True
+        if timeout_seconds is not None:
+            result["timeout_seconds"] = timeout_seconds
+
+    output_exists = output_path.exists() and output_path.is_file()
+    status = str(result.get("status") or "").strip().lower()
+    if output_exists:
+        result["status"] = "completed" if status != "failed" and returncode in (0, None) else "failed"
+    elif status == "completed":
+        result["status"] = "failed"
+        result.setdefault("error", "omx completed metadata without output artifact")
+    else:
+        result["status"] = status or "failed"
+        if timed_out:
+            result.setdefault("error", f"omx execution timed out after {timeout_seconds}s")
+        else:
+            result.setdefault("error", "omx execution did not produce output artifacts")
+
+    result.setdefault("auth_failed", _detect_auth_failure(stdout, stderr))
+    result.setdefault("executor_unavailable", False)
+    return result
+
 
 def _detect_auth_failure(stdout: str, stderr: str) -> bool:
     text = f"{stdout}\n{stderr}".lower()
@@ -259,14 +334,19 @@ def execute_request(
     command_override: str | None = None,
 ) -> dict[str, Any]:
     request_path = write_execution_request(request)
-    cwd = str(Path(workdir) if workdir is not None else Path(str(request["state_dir"])))
+    requested_cwd = Path(workdir) if workdir is not None else Path(str(request["state_dir"]))
+    # Messaging shells can hand us a stale/deleted cwd. Fall back to the
+    # freshly-created state dir so the handoff can still write artifacts.
+    cwd_path = requested_cwd if requested_cwd.is_dir() else Path(str(request["state_dir"]))
+    cwd = str(cwd_path)
     cmd = build_omx_exec_command(request, request_path=request_path, command_override=command_override, workdir=cwd)
-    timeout = int(request.get("executor_policy", {}).get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
+    timeout = _safe_timeout_seconds(request.get("executor_policy", {}).get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
 
     workflow = str(request.get("executor_policy", {}).get("workflow", DEFAULT_WORKFLOW))
     launch_mode = str(request.get("executor_policy", {}).get("launch_mode", "exec"))
     output_path = Path(str(request["output_path"]))
     result_path = Path(str(request["result_path"]))
+    _prepare_attempt_artifacts(output_path, result_path)
 
     # Capture tool versions up-front so every return path — including the
     # failure paths — can persist them. Otherwise routing_outcomes.jsonl loses
@@ -319,25 +399,16 @@ def execute_request(
         return result
     except subprocess.TimeoutExpired as exc:
         if result_path.exists():
-            try:
-                result = json.loads(result_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                result = {}
-            for key, value in base.items():
-                result.setdefault(key, value)
-            if output_path.exists():
-                result["status"] = "completed"
-            else:
-                result.setdefault("status", "failed")
-            result.setdefault("returncode", None)
-            result["timed_out"] = True
-            result["timeout_seconds"] = timeout
-            result.setdefault("stdout", exc.stdout or "")
-            result.setdefault("stderr", exc.stderr or "")
-            if not output_path.exists():
-                result.setdefault("auth_failed", False)
-                result.setdefault("executor_unavailable", False)
-                result.setdefault("error", f"omx execution timed out after {timeout}s")
+            result = _result_from_artifacts(
+                result_path=result_path,
+                output_path=output_path,
+                base=base,
+                returncode=None,
+                stdout=exc.stdout or "",
+                stderr=exc.stderr or "",
+                timed_out=True,
+                timeout_seconds=timeout,
+            )
             _persist_execution_result(result_path, result)
             return result
         if output_path.exists():
@@ -368,13 +439,14 @@ def execute_request(
         return result
 
     if result_path.exists():
-        try:
-            result = json.loads(result_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            result = {}
-        for key, value in base.items():
-            result.setdefault(key, value)
-        result.setdefault("returncode", proc.returncode)
+        result = _result_from_artifacts(
+            result_path=result_path,
+            output_path=output_path,
+            base=base,
+            returncode=proc.returncode,
+            stdout=proc.stdout,
+            stderr=proc.stderr,
+        )
         _persist_execution_result(result_path, result)
         return result
 
