@@ -682,14 +682,21 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
                 conn, title="long job", assignee="worker",
                 max_runtime_seconds=1,  # one second cap
             )
-            # Spawn by hand: claim + set pid + set started_at to the past.
+            # Spawn by hand: claim + set pid + set active run start to the past.
             kb.claim_task(conn, tid)
             kb._set_worker_pid(conn, tid, os.getpid())   # any live pid works
-            # Backdate started_at so elapsed > limit.
+            # Backdate both the task-level first-start timestamp and the active
+            # run timestamp so elapsed > limit under the per-run runtime model.
+            old_started = int(time.time()) - 30
             with kb.write_txn(conn):
                 conn.execute(
                     "UPDATE tasks SET started_at = ? WHERE id = ?",
-                    (int(time.time()) - 30, tid),
+                    (old_started, tid),
+                )
+                conn.execute(
+                    "UPDATE task_runs SET started_at = ? "
+                    "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                    (old_started, tid),
                 )
 
             timed_out = kb.enforce_max_runtime(conn, signal_fn=_signal_fn)
@@ -769,10 +776,16 @@ def test_enforce_max_runtime_integrates_with_dispatch(kanban_home, monkeypatch):
         )
         kb.claim_task(conn, tid)
         kb._set_worker_pid(conn, tid, os.getpid())
+        old_started = int(time.time()) - 30
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET started_at = ? WHERE id = ?",
-                (int(time.time()) - 30, tid),
+                (old_started, tid),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (old_started, tid),
             )
         # Use enforce_max_runtime directly with our signal stub — dispatch_once
         # uses the default os.kill, but integration-wise calling
@@ -2978,6 +2991,46 @@ def test_complete_with_cross_worker_card_is_rejected(kanban_home):
         conn.close()
 
 
+def test_complete_accepts_cross_worker_card_when_linked_as_child(kanban_home):
+    """A card created by a different principal but explicitly linked as
+    a child of the completing task is accepted — the worker took
+    ownership via ``kanban_create(parents=[current_task])`` or an
+    explicit ``link_tasks`` call, which proves the relationship even
+    when ``created_by`` doesn't match.
+
+    (Relaxation salvaged from #20022 @LeonSGP43 — stricter version
+    would incorrectly reject legitimate orchestrator flows where a
+    specifier creates a card, then a worker picks it up and links it
+    to its own parent task.)
+    """
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        # Card created by a DIFFERENT principal (not alice, not parent).
+        other = kb.create_task(
+            conn, title="other", assignee="x", created_by="bob",
+            parents=[parent],  # explicitly links as child of the completing task
+        )
+
+        ok = kb.complete_task(
+            conn, parent,
+            summary="completed with linked child",
+            created_cards=[other],
+        )
+        assert ok is True
+        # The card should appear in the completed event's verified_cards list.
+        import json as _json
+        row = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id=? AND kind='completed' ORDER BY id DESC LIMIT 1",
+            (parent,),
+        ).fetchone()
+        payload = _json.loads(row["payload"])
+        assert other in payload.get("verified_cards", [])
+    finally:
+        conn.close()
+
+
 def test_complete_prose_scan_flags_nonexistent_ids(kanban_home):
     """Successful completion whose summary references a ``t_<hex>`` id
     that doesn't resolve emits a ``suspected_hallucinated_references``
@@ -3184,10 +3237,21 @@ def test_enforce_max_runtime_increments_consecutive_failures(kanban_home, monkey
         )
         kb.claim_task(conn, tid)
         kb._set_worker_pid(conn, tid, os.getpid())
+        # Since PR #19473 (salvaged) changed enforce_max_runtime to read
+        # from task_runs.started_at (per-attempt) rather than
+        # tasks.started_at (lifetime), we need to backdate BOTH to
+        # guarantee the timeout fires regardless of which column the
+        # query pulls from.
         with kb.write_txn(conn):
+            long_ago = int(time.time()) - 30
             conn.execute(
                 "UPDATE tasks SET started_at = ? WHERE id = ?",
-                (int(time.time()) - 30, tid),
+                (long_ago, tid),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (long_ago, tid),
             )
         before = kb.get_task(conn, tid)
         assert before.consecutive_failures == 0
